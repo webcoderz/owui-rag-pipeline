@@ -481,7 +481,7 @@ class Pipeline:
                             await emit(f"❌ Indexing failed (other request): `{filename}`\n")
                         return
 
-                    await emit(f"📤 Uploading `{filename}` to NVIDIA…\n")
+                    await emit(f"📤 Uploading `{filename}` to RAG…\n")
                     await self._call_worker_ingest_from_path(worker_client, collection_name, filename, tmp_path)
                     await self._manifest_set(file_id, collection_name, sha, "success")
                     await emit(f"✅ Indexed: `{filename}`\n")
