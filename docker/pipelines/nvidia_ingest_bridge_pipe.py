@@ -1,13 +1,15 @@
 """
 title: NVIDIA RAG (Worker • Postgres • Chat Allowlist • User Library • SSE)
-author: Cody Webb
-version: 1.1.0
+author: you
+version: 1.2.0
 requirements: httpx, asyncpg
 """
 
 import asyncio
 import hashlib
 import json
+import os
+import tempfile
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,9 +25,6 @@ def _now() -> int:
 
 
 def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> str:
-    """
-    OpenAI chat.completions streaming chunk (SSE).
-    """
     delta: Dict[str, Any] = {}
     if role:
         delta["role"] = role
@@ -42,53 +41,48 @@ def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> str
 
 
 class Pipeline:
-    """
-    Open WebUI Pipelines Pipe.
-
-    Responsibilities:
-      - Resolve OWUI attachments + knowledge collections
-      - Enforce collection scoping server-side
-      - Persist chat allowlist + user library preferences in Postgres
-      - Persist ingestion manifest in Postgres (dedupe + concurrency claims)
-      - Call NVIDIA worker (py3.12) for ingest + generate
-      - Stream status + model output (SSE) back to Open WebUI
-    """
-
     class Valves(BaseModel):
         # Open WebUI
         OPENWEBUI_BASE_URL: str = Field(default="http://open-webui:8080")
         OPENWEBUI_API_KEY: str = Field(default="")  # service token (Bearer)
 
-        # NVIDIA worker (py3.12) + Milvus endpoint
+        # NVIDIA worker + Milvus
         NVIDIA_WORKER_URL: str = Field(default="http://nvidia-rag-worker:8123")
         VDB_ENDPOINT: str = Field(default="http://milvus:19530")
 
-        # Postgres (persistent)
-        DATABASE_URL: str = Field(default="postgresql://owui:owui_pw@postgres:5432/owui_bridge")
+        # Postgres
+        DATABASE_URL: str = Field(default="postgresql://owui:owui@owui-postgres:5432/owui_bridge")
 
         # Naming/policy
         COLLECTION_PREFIX: str = Field(default="owui")
         USER_SCOPED_CHAT_COLLECTIONS: bool = Field(default=True)
 
-        # Library behavior
+        # Library defaults
         LIBRARY_ENABLED_DEFAULT: bool = Field(default=True)
         LIBRARY_INCLUDE_BY_DEFAULT: bool = Field(default=True)
 
         # Concurrency knobs
         MAX_PARALLEL_FILE_INGEST: int = Field(default=3)
 
-        # Manifest "pending" wait (if another request claimed the same work)
+        # Manifest pending wait
         PENDING_WAIT_SECONDS: int = Field(default=180)
         PENDING_POLL_INTERVAL: float = Field(default=1.0)
 
-        # Chunking defaults passed to worker
+        # Chunking defaults
         CHUNK_SIZE: int = Field(default=512)
         CHUNK_OVERLAP: int = Field(default=150)
 
         # Timeouts
-        OWUI_FILE_TIMEOUT_S: int = Field(default=600)
+        OWUI_JSON_TIMEOUT_S: int = Field(default=60)
+        OWUI_STREAM_TIMEOUT_S: int = Field(default=600)
         WORKER_INGEST_TIMEOUT_S: int = Field(default=1800)
         WORKER_GENERATE_TIMEOUT_S: int = Field(default=600)
+
+        # Limits
+        MAX_FILE_BYTES: int = Field(default=200 * 1024 * 1024)  # 200MB
+
+        # Progress throttling
+        PROGRESS_EMIT_EVERY_PCT: int = Field(default=10)
 
     def __init__(self):
         self.valves = self.Valves()
@@ -108,14 +102,10 @@ class Pipeline:
         return self._pool
 
     async def _init_db(self) -> None:
-        """
-        Creates required tables if missing (safe to call multiple times).
-        """
         pool = self._pool
         if not pool:
             return
         async with pool.acquire() as conn:
-            # Ingestion manifest for idempotency/dedupe + cross-request concurrency claims
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ingest_manifest (
@@ -128,8 +118,6 @@ class Pipeline:
                 );
                 """
             )
-
-            # Per-chat allowlist of collections ("chat remembers what was attached/used")
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS chat_allowlist (
@@ -141,11 +129,7 @@ class Pipeline:
                 );
                 """
             )
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS chat_allowlist_lookup ON chat_allowlist (user_key, chat_id);"
-            )
-
-            # User library settings
+            await conn.execute("CREATE INDEX IF NOT EXISTS chat_allowlist_lookup ON chat_allowlist (user_key, chat_id);")
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_library_settings (
@@ -157,6 +141,18 @@ class Pipeline:
                 );
                 """
             )
+            # per-chat settings (save_to_library toggle etc.)
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_settings (
+                  user_key TEXT NOT NULL,
+                  chat_id TEXT NOT NULL,
+                  save_to_library BOOLEAN NOT NULL DEFAULT FALSE,
+                  updated_at BIGINT NOT NULL,
+                  PRIMARY KEY (user_key, chat_id)
+                );
+                """
+            )
 
     def _user_key(self, user: dict) -> str:
         return str(user.get("id") or user.get("email") or "anon")
@@ -165,11 +161,10 @@ class Pipeline:
         return user_key.replace("@", "_").replace(":", "_").replace("/", "_")
 
     # -----------------------
-    # OWUI naming policies
+    # Collection names
     # -----------------------
 
     def _kb_collection_name(self, kb_id: str, kb_meta: dict) -> str:
-        # stable KB naming
         is_public = kb_meta.get("is_public")
         visibility = kb_meta.get("visibility")
         publicish = str(is_public).lower() in ("true", "1") or str(visibility).lower() == "public"
@@ -216,10 +211,6 @@ class Pipeline:
             )
 
     async def _library_include_by_default(self, user_key: str) -> bool:
-        """
-        Returns whether we should auto-include the user's library collection on every chat request.
-        Creates a default row if missing.
-        """
         pool = await self._db()
         now = _now()
         async with pool.acquire() as conn:
@@ -229,8 +220,6 @@ class Pipeline:
             )
             if row:
                 return bool(row["enabled"]) and bool(row["include_by_default"])
-
-            # Create defaults
             await conn.execute(
                 """
                 INSERT INTO user_library_settings (user_key, enabled, include_by_default, created_at, updated_at)
@@ -243,8 +232,31 @@ class Pipeline:
             )
             return bool(self.valves.LIBRARY_ENABLED_DEFAULT) and bool(self.valves.LIBRARY_INCLUDE_BY_DEFAULT)
 
+    async def _chat_get_save_to_library(self, user_key: str, chat_id: str) -> bool:
+        pool = await self._db()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT save_to_library FROM chat_settings WHERE user_key=$1 AND chat_id=$2",
+                user_key, chat_id
+            )
+        return bool(row["save_to_library"]) if row else False
+
+    async def _chat_set_save_to_library(self, user_key: str, chat_id: str, value: bool) -> None:
+        pool = await self._db()
+        now = _now()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO chat_settings (user_key, chat_id, save_to_library, updated_at)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_key, chat_id)
+                DO UPDATE SET save_to_library=EXCLUDED.save_to_library, updated_at=EXCLUDED.updated_at
+                """,
+                user_key, chat_id, value, now
+            )
+
     # -----------------------
-    # Ingest manifest (dedupe + claims)
+    # Ingest manifest
     # -----------------------
 
     async def _manifest_get_status(self, file_id: str, collection: str, sha: str) -> Optional[str]:
@@ -257,10 +269,6 @@ class Pipeline:
         return row["status"] if row else None
 
     async def _manifest_try_claim(self, file_id: str, collection: str, sha: str) -> bool:
-        """
-        Insert a 'pending' row if absent. True means we claimed and should ingest.
-        False means someone else already has pending/success/failed for that sha.
-        """
         pool = await self._db()
         async with pool.acquire() as conn:
             res = await conn.execute(
@@ -271,7 +279,7 @@ class Pipeline:
                 """,
                 file_id, collection, sha, _now()
             )
-        return res.endswith("1")  # "INSERT 0 1" or "INSERT 0 0"
+        return res.endswith("1")
 
     async def _manifest_set(self, file_id: str, collection: str, sha: str, status: str) -> None:
         pool = await self._db()
@@ -305,20 +313,69 @@ class Pipeline:
         r = await client.get(
             f"{self.valves.OPENWEBUI_BASE_URL}{path}",
             headers=self._ow_headers(),
-            timeout=60
+            timeout=self.valves.OWUI_JSON_TIMEOUT_S
         )
         r.raise_for_status()
         return r.json()
 
-    async def _ow_get_bytes(self, client: httpx.AsyncClient, file_id: str) -> bytes:
-        r = await client.get(
-            f"{self.valves.OPENWEBUI_BASE_URL}/api/v1/files/{file_id}/content",
+    async def _download_to_tempfile_and_hash(
+        self,
+        client: httpx.AsyncClient,
+        file_id: str,
+        filename: str,
+        emit,
+        model_id: str,
+    ) -> Tuple[str, str, int]:
+        """
+        Streams OWUI file content to a temp file to avoid RAM spikes.
+        Returns: (tmp_path, sha256_hex, byte_count)
+        """
+        url = f"{self.valves.OPENWEBUI_BASE_URL}/api/v1/files/{file_id}/content"
+        h = hashlib.sha256()
+        byte_count = 0
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[-1] or "")
+        tmp_path = tmp.name
+        tmp.close()
+
+        last_emit_pct = -1
+
+        async with client.stream(
+            "GET",
+            url,
             headers=self._ow_headers(),
             params={"attachment": "false"},
-            timeout=self.valves.OWUI_FILE_TIMEOUT_S
-        )
-        r.raise_for_status()
-        return r.content
+            timeout=self.valves.OWUI_STREAM_TIMEOUT_S
+        ) as r:
+            r.raise_for_status()
+            cl = r.headers.get("content-length")
+            total = int(cl) if cl and cl.isdigit() else None
+            if total and total > self.valves.MAX_FILE_BYTES:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                raise ValueError(f"File too large (> {self.valves.MAX_FILE_BYTES} bytes)")
+
+            with open(tmp_path, "wb") as f:
+                async for chunk in r.aiter_bytes():
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    h.update(chunk)
+                    byte_count += len(chunk)
+
+                    if byte_count > self.valves.MAX_FILE_BYTES:
+                        raise ValueError(f"File too large (> {self.valves.MAX_FILE_BYTES} bytes)")
+
+                    if total:
+                        pct = int((byte_count / total) * 100)
+                        step = self.valves.PROGRESS_EMIT_EVERY_PCT
+                        pct_bucket = (pct // step) * step
+                        if pct_bucket != last_emit_pct and pct_bucket in (0, step, 2*step, 3*step, 4*step, 5*step, 6*step, 7*step, 8*step, 9*step, 100):
+                            await emit(f"⬇️ Download `{filename}`… {pct_bucket}%\n")
+                            last_emit_pct = pct_bucket
+
+        return tmp_path, h.hexdigest(), byte_count
 
     def _split_refs(self, files: List[dict]) -> Tuple[List[str], List[str]]:
         adhoc, kb_ids = [], []
@@ -336,14 +393,13 @@ class Pipeline:
     # Worker calls
     # -----------------------
 
-    async def _call_worker_ingest(
+    async def _call_worker_ingest_from_path(
         self,
         client: httpx.AsyncClient,
         collection_name: str,
         filename: str,
-        data: bytes,
+        tmp_path: str,
     ) -> dict:
-        files = {"file": (filename, data)}
         form = {
             "collection_name": collection_name,
             "vdb_endpoint": self.valves.VDB_ENDPOINT,
@@ -352,27 +408,23 @@ class Pipeline:
             "chunk_overlap": str(self.valves.CHUNK_OVERLAP),
             "generate_summary": "false",
         }
-        r = await client.post(
-            f"{self.valves.NVIDIA_WORKER_URL}/ingest",
-            data=form,
-            files=files,
-            timeout=self.valves.WORKER_INGEST_TIMEOUT_S
-        )
+        with open(tmp_path, "rb") as f:
+            files = {"file": (filename, f)}
+            r = await client.post(
+                f"{self.valves.NVIDIA_WORKER_URL}/ingest",
+                data=form,
+                files=files,
+                timeout=self.valves.WORKER_INGEST_TIMEOUT_S
+            )
         r.raise_for_status()
         return r.json()
 
-    async def _stream_worker_generate(
-        self,
-        client: httpx.AsyncClient,
-        messages: List[dict],
-        collection_names: List[str],
-    ):
+    async def _stream_worker_generate(self, client: httpx.AsyncClient, messages: List[dict], collection_names: List[str]):
         payload = {
             "messages": messages,
             "collection_names": collection_names,
             "use_knowledge_base": bool(collection_names),
         }
-
         async with client.stream(
             "POST",
             f"{self.valves.NVIDIA_WORKER_URL}/generate",
@@ -381,9 +433,8 @@ class Pipeline:
         ) as r:
             r.raise_for_status()
             async for line in r.aiter_lines():
-                if not line:
-                    continue
-                yield line
+                if line:
+                    yield line
 
     # -----------------------
     # Ingest orchestration
@@ -396,38 +447,64 @@ class Pipeline:
         entries: List[Tuple[str, str]],  # (file_id, filename)
         collection_name: str,
         emit,
+        model_id: str,
     ) -> None:
         sem = asyncio.Semaphore(self.valves.MAX_PARALLEL_FILE_INGEST)
+        total = len(entries)
+        done = 0
+        done_lock = asyncio.Lock()
 
         async def one(file_id: str, filename: str):
+            nonlocal done
             async with sem:
                 await emit(f"🔎 Processing `{filename}`…\n")
-                data = await self._ow_get_bytes(ow_client, file_id)
-                sha = hashlib.sha256(data).hexdigest()
 
-                st = await self._manifest_get_status(file_id, collection_name, sha)
-                if st == "success":
-                    await emit(f"↩️ Skip (already indexed): `{filename}`\n")
-                    return
-
-                claimed = await self._manifest_try_claim(file_id, collection_name, sha)
-                if not claimed:
-                    await emit(f"⏳ Another request is indexing `{filename}`…\n")
-                    terminal = await self._wait_for_terminal(file_id, collection_name, sha)
-                    if terminal == "success":
-                        await emit(f"✅ Ready: `{filename}`\n")
-                    else:
-                        await emit(f"❌ Indexing failed (other request): `{filename}`\n")
-                    return
-
+                tmp_path = None
+                sha = None
                 try:
+                    tmp_path, sha, _ = await self._download_to_tempfile_and_hash(
+                        ow_client, file_id, filename, emit, model_id
+                    )
+
+                    st = await self._manifest_get_status(file_id, collection_name, sha)
+                    if st == "success":
+                        await emit(f"↩️ Skip (already indexed): `{filename}`\n")
+                        return
+
+                    claimed = await self._manifest_try_claim(file_id, collection_name, sha)
+                    if not claimed:
+                        await emit(f"⏳ Another request is indexing `{filename}`…\n")
+                        terminal = await self._wait_for_terminal(file_id, collection_name, sha)
+                        if terminal == "success":
+                            await emit(f"✅ Ready: `{filename}`\n")
+                        else:
+                            await emit(f"❌ Indexing failed (other request): `{filename}`\n")
+                        return
+
                     await emit(f"📤 Uploading `{filename}` to NVIDIA…\n")
-                    await self._call_worker_ingest(worker_client, collection_name, filename, data)
+                    await self._call_worker_ingest_from_path(worker_client, collection_name, filename, tmp_path)
                     await self._manifest_set(file_id, collection_name, sha, "success")
                     await emit(f"✅ Indexed: `{filename}`\n")
+
+                except ValueError as ve:
+                    # size limit etc.
+                    await emit(f"❌ {ve} — `{filename}`\n")
+                    if sha:
+                        await self._manifest_set(file_id, collection_name, sha, "failed")
                 except Exception:
-                    await self._manifest_set(file_id, collection_name, sha, "failed")
+                    if sha:
+                        await self._manifest_set(file_id, collection_name, sha, "failed")
                     raise
+                finally:
+                    if tmp_path:
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                    async with done_lock:
+                        done += 1
+                        pct = int((done / max(total, 1)) * 100)
+                        await emit(f"📦 Ingest progress: {done}/{total} ({pct}%)\n")
 
         await asyncio.gather(*(one(fid, fname) for fid, fname in entries))
 
@@ -440,51 +517,61 @@ class Pipeline:
         user_key = self._user_key(user)
         model_id = body.get("model") or "nvidia-rag-auto-ingest"
 
-        # Stable chat_id is important for per-chat memory
-        chat_id = body.get("chat_id")
-        if not chat_id:
-            chat_id = body.get("conversation_id") or body.get("id") or str(_now())
-
-        # Optional flag: if true, also ingest attachments into per-user library collection
-        # (You can later wire a UI toggle or action that sets this.)
-        save_to_library = bool(body.get("save_to_library", False))
-
+        chat_id = body.get("chat_id") or body.get("conversation_id") or body.get("id") or str(_now())
 
         async def runner():
-
             yield _sse_chunk(model_id, role="assistant")
+
             if not self.valves.OPENWEBUI_API_KEY:
-                yield _sse_chunk(model_id, "❌ OPENWEBUI_API_KEY is not set. Pipeline cannot access OWUI files/knowledge.\n")
+                yield _sse_chunk(model_id, "❌ OPENWEBUI_API_KEY is not set. Cannot access OWUI files/knowledge.\n")
                 yield "data: [DONE]\n\n"
                 return
 
-            # Status queue so we can interleave status with worker stream cleanly
             status_q: asyncio.Queue[str] = asyncio.Queue()
 
             async def emit(msg: str):
                 await status_q.put(_sse_chunk(model_id, msg))
 
             async with httpx.AsyncClient() as ow_client, httpx.AsyncClient() as worker_client:
-                # 1) Start with per-chat remembered collections
+                # Chat command: /library on|off
+                messages = body.get("messages") or []
+                if messages and (messages[-1].get("role") == "user"):
+                    text = (messages[-1].get("content") or "").strip().lower()
+                    if text in ("/library on", "/library true", "/library enable"):
+                        await self._chat_set_save_to_library(user_key, chat_id, True)
+                        yield _sse_chunk(model_id, "✅ This chat will save new ingests to your library.\n")
+                        yield "data: [DONE]\n\n"
+                        return
+                    if text in ("/library off", "/library false", "/library disable"):
+                        await self._chat_set_save_to_library(user_key, chat_id, False)
+                        yield _sse_chunk(model_id, "✅ This chat will NOT save new ingests to your library.\n")
+                        yield "data: [DONE]\n\n"
+                        return
+
+                # Save-to-library decision:
+                # - explicit request field wins
+                # - else use per-chat setting
+                save_to_library = bool(body.get("save_to_library", await self._chat_get_save_to_library(user_key, chat_id)))
+
+                # 1) Seed collections from remembered allowlist
                 remembered = await self._allowlist_get(user_key, chat_id)
                 collection_names: List[str] = list(dict.fromkeys(remembered))
 
-                # 2) Optionally auto-include user library across chats
+                # 2) Auto-include per-user library across chats (if enabled)
+                lib_collection = self._library_collection_name(user_key)
                 if await self._library_include_by_default(user_key):
-                    lib_collection = self._library_collection_name(user_key)
                     collection_names.append(lib_collection)
                     collection_names = list(dict.fromkeys(collection_names))
 
-                # 3) Handle attachments (ingest + update allowlist)
+                # 3) Attachments
                 files = body.get("files") or []
                 newly_used: List[str] = []
 
                 if files:
                     await emit("📎 Attachments detected. Preparing ingestion…\n")
-
                     adhoc_file_ids, kb_ids = self._split_refs(files)
 
-                    # Knowledge collections -> per-KB collections
+                    # Knowledge collections
                     for kb_id in kb_ids:
                         kb_meta = await self._ow_get_json(ow_client, f"/api/v1/knowledge/{kb_id}")
                         kb_collection = self._kb_collection_name(kb_id, kb_meta)
@@ -500,17 +587,18 @@ class Pipeline:
                             entries.append((fid, fname))
 
                         await emit(f"📥 KB files: {len(entries)}\n")
-                        await self._ingest_entries_into_collection(ow_client, worker_client, entries, kb_collection, emit)
-
+                        await self._ingest_entries_into_collection(
+                            ow_client, worker_client, entries, kb_collection, emit, model_id
+                        )
                         newly_used.append(kb_collection)
 
-                        # Optional: also save KB docs to user library
                         if save_to_library:
-                            lib_collection = self._library_collection_name(user_key)
                             await emit(f"📚 Saving KB docs to your library → `{lib_collection}`\n")
-                            await self._ingest_entries_into_collection(ow_client, worker_client, entries, lib_collection, emit)
+                            await self._ingest_entries_into_collection(
+                                ow_client, worker_client, entries, lib_collection, emit, model_id
+                            )
 
-                    # Ad-hoc uploads -> per-chat collection
+                    # Ad-hoc uploads
                     if adhoc_file_ids:
                         chat_collection = self._chat_collection_name(chat_id, user)
                         await emit(f"📥 Chat uploads → `{chat_collection}`\n")
@@ -520,58 +608,52 @@ class Pipeline:
                             try:
                                 meta = await self._ow_get_json(ow_client, f"/api/v1/files/{fid}")
                                 fname = meta.get("filename") or meta.get("name") or fid
-
                                 size = meta.get("size") or meta.get("file_size")
-                                if size and int(size) > 200 * 1024 * 1024:
+                                if size and int(size) > self.valves.MAX_FILE_BYTES:
                                     await emit(f"❌ File too large (>200MB): `{fname}`\n")
-                                    return
-
+                                    continue
                             except Exception:
                                 fname = fid
                             entries.append((fid, fname))
 
                         await emit(f"📥 Uploads: {len(entries)}\n")
-                        await self._ingest_entries_into_collection(ow_client, worker_client, entries, chat_collection, emit)
-
+                        await self._ingest_entries_into_collection(
+                            ow_client, worker_client, entries, chat_collection, emit, model_id
+                        )
                         newly_used.append(chat_collection)
 
                         if save_to_library:
-                            lib_collection = self._library_collection_name(user_key)
                             await emit(f"📚 Saving uploads to your library → `{lib_collection}`\n")
-                            await self._ingest_entries_into_collection(ow_client, worker_client, entries, lib_collection, emit)
+                            await self._ingest_entries_into_collection(
+                                ow_client, worker_client, entries, lib_collection, emit, model_id
+                            )
 
                     await emit("✅ Ingestion complete.\n")
 
-                    # Persist newly used collections for this chat
+                    # Persist chat remember-set
                     if newly_used:
                         await self._allowlist_add(user_key, chat_id, list(dict.fromkeys(newly_used)))
                         collection_names = list(dict.fromkeys(collection_names + newly_used))
 
-                # 4) Query phase: always compute final allowlisted collection_names server-side
-                # If you want “no files selected => no private retrieval”, you can add a policy here.
+                # 4) Query
                 await emit("💬 Querying…\n")
 
-                messages = body.get("messages") or []
-
-                # Drain any queued status before we start streaming tokens
+                # Drain any queued status before streaming tokens
                 while not status_q.empty():
                     yield await status_q.get()
 
-                async for line in self._stream_worker_generate(worker_client, messages, list(dict.fromkeys(collection_names))):
-                    # keep status responsive
+                final_collections = list(dict.fromkeys(collection_names))
+                async for line in self._stream_worker_generate(worker_client, messages, final_collections):
                     while not status_q.empty():
                         yield await status_q.get()
-
                     line = line.strip()
                     if not line:
                         continue
-                    # Pass through SSE lines
                     if line.startswith("data:"):
                         yield line + "\n\n"
                     else:
                         yield "data: " + line + "\n\n"
 
-                # Final drain
                 while not status_q.empty():
                     yield await status_q.get()
 
