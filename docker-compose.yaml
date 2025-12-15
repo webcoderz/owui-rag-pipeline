@@ -1,0 +1,55 @@
+services:
+
+  nvidia-rag-worker:
+    build:
+      context: ./docker/worker
+      dockerfile: Dockerfile.worker
+    ports:
+      - "8123:8123"
+    depends_on:
+      - owui-postgres 
+    networks:
+      - default
+    #  - nvidia-rag
+
+
+  pipelines:
+    image: ghcr.io/open-webui/pipelines:main
+    environment:
+      OPENWEBUI_BASE_URL: http://open-webui:8080
+      OPENWEBUI_API_KEY: ${OPENWEBUI_API_KEY}
+      NVIDIA_WORKER_URL: http://nvidia-rag-worker:8123
+      VDB_ENDPOINT: http://milvus:19530
+      PIPELINES_API_KEY: 0p3n-w3bu!
+      DATABASE_URL: postgresql://owui:owui@owui-postgres:5432/owui_bridge
+      MAX_PARALLEL_FILE_INGEST: "4"
+    volumes:
+      - ./docker/pipelines/nvidia_ingest_bridge_pipe.py:/app/pipelines/nvidia_ingest_bridge_pipe.py:ro
+
+    depends_on:
+      - owui-postgres
+    networks:
+      - default
+    #  - nvidia-rag
+
+  owui-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: owui_bridge
+      POSTGRES_USER: owui
+      POSTGRES_PASSWORD: owui
+    volumes:
+      - owui_pg:/var/lib/postgresql/data
+    networks:
+      - default
+
+volumes:
+  owui_pg:
+  pipelines_data: 
+  #open-webui:
+
+networks:
+  default:
+    #external: true
+  #nvidia-rag:
+  #  external: true
