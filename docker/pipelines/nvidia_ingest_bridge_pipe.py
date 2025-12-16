@@ -1,6 +1,6 @@
 """
 title: NVIDIA RAG (Worker • Postgres • Chat Allowlist • User Library • SSE)
-author: you
+author: Cody Webb
 version: 1.2.0
 requirements: httpx, asyncpg
 """
