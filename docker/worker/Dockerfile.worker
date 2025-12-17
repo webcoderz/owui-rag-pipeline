@@ -1,9 +1,17 @@
 FROM python:3.12-slim
 
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY}
+ENV HTTPS_PROXY=${HTTPS_PROXY}
+ENV http_proxy=${HTTP_PROXY}
+ENV https_proxy=${HTTPS_PROXY}
+ENV PIP_OPTIONS="--proxy ${HTTP_PROXY} --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host  pypi.python.org --no-cache-dir"
+
 WORKDIR /app
 
 # basic deps (python-multipart needed for UploadFile)
-RUN pip install --no-cache-dir fastapi uvicorn[standard] python-multipart nvidia-rag[rag,ingest]
+RUN pip install $PIP_OPTIONS fastapi uvicorn[standard] python-multipart nvidia-rag[rag,ingest]
 
 COPY nvidia_rag_worker.py /app/nvidia_rag_worker.py
 
