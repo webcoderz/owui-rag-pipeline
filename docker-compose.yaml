@@ -4,13 +4,16 @@ services:
     build:
       context: ./docker/worker
       dockerfile: Dockerfile.worker
+      args:
+        HTTP_PROXY: ${HTTP_PROXY}
+        HTTPS_PROXY: ${HTTPS_PROXY}
     ports:
       - "8123:8123"
     depends_on:
       - owui-postgres 
     networks:
       - default
-    #  - nvidia-rag
+      - nvidia-rag
 
 
   pipelines:
@@ -30,7 +33,7 @@ services:
       - owui-postgres
     networks:
       - default
-    #  - nvidia-rag
+      - nvidia-rag
 
   owui-postgres:
     image: postgres:16
@@ -50,6 +53,6 @@ volumes:
 
 networks:
   default:
-    #external: true
-  #nvidia-rag:
-  #  external: true
+    external: true
+  nvidia-rag:
+    external: true
