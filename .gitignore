@@ -210,3 +210,5 @@ __marimo__/
 
 *openapi.json
 nv-rag.py
+.python-version
+__pycache__/
