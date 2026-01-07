@@ -512,7 +512,15 @@ class Pipeline:
     # Main pipe
     # -----------------------
 
-    async def pipe(self, body: dict, __user__: Optional[dict] = None):
+    async def pipe(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        # Open WebUI Pipelines may pass additional context as kwargs depending on version.
+        # We accept these explicitly (and **kwargs) to remain forward-compatible.
+        user_message: Optional[str] = None,
+        **kwargs,
+    ):
         user = __user__ or {}
         user_key = self._user_key(user)
         model_id = body.get("model") or "nvidia-rag-auto-ingest"
@@ -535,8 +543,14 @@ class Pipeline:
             async with httpx.AsyncClient() as ow_client, httpx.AsyncClient() as worker_client:
                 # Chat command: /library on|off
                 messages = body.get("messages") or []
+                last_user_text = ""
                 if messages and (messages[-1].get("role") == "user"):
-                    text = (messages[-1].get("content") or "").strip().lower()
+                    last_user_text = (messages[-1].get("content") or "")
+
+                # Prefer runtime-provided `user_message` if present (newer Pipelines versions),
+                # otherwise fall back to the last user message in the chat payload.
+                text = ((user_message or last_user_text) or "").strip().lower()
+                if text:
                     if text in ("/library on", "/library true", "/library enable"):
                         await self._chat_set_save_to_library(user_key, chat_id, True)
                         yield _sse_chunk(model_id, "✅ This chat will save new ingests to your library.\n")
