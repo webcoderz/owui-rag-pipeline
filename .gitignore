@@ -212,3 +212,4 @@ __marimo__/
 nv-rag.py
 .python-version
 __pycache__/
+.tmp/

@@ -8,6 +8,26 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
+# ----
+# IMPORTANT (NVIDIA RAG SDK dependency):
+# The `nvidia_rag` package imports/initializes its ingestor server and MinIO operator at import time.
+# If MINIO_* env vars are missing, it may default to localhost:9010 inside the container and fail.
+# ----
+
+def _require_env(name: str) -> str:
+    v = (os.getenv(name) or "").strip()
+    if not v:
+        raise RuntimeError(
+            f"{name} is not set. The NVIDIA RAG SDK requires MinIO configuration inside Docker. "
+            f"Set {name} (and MINIO_ACCESSKEY/MINIO_SECRETKEY) to a hostname reachable from the container "
+            f"(e.g. MINIO_ENDPOINT=minio:9010), not localhost."
+        )
+    return v
+
+_require_env("MINIO_ENDPOINT")
+_require_env("MINIO_ACCESSKEY")
+_require_env("MINIO_SECRETKEY")
+
 # NVIDIA client SDK (py3.12+)
 from nvidia_rag import NvidiaRAG, NvidiaRAGIngestor
 

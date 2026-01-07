@@ -36,6 +36,15 @@ OPENWEBUI_API_KEY=your-openwebui-service-token
 HTTP_PROXY=
 HTTPS_PROXY=
 NO_PROXY=localhost,127.0.0.1,open-webui,pipelines,nvidia-rag-worker,owui-postgres,milvus
+
+# NVIDIA RAG SDK (MinIO is required for ingestion internals)
+# IMPORTANT: inside Docker, localhost points at the container itself.
+# Use the MinIO service hostname reachable on your Docker network.
+MINIO_ENDPOINT=minio:9010
+MINIO_ACCESSKEY=minioadmin
+MINIO_SECRETKEY=minioadmin
+# Optional
+NVINGEST_MINIO_BUCKET=nv-ingest
 ```
 
 Notes:

@@ -7,18 +7,35 @@ services:
       args:
         HTTP_PROXY: ${HTTP_PROXY}
         HTTPS_PROXY: ${HTTPS_PROXY}
+    environment:
+      # Proxy support (optional)
+      HTTP_PROXY: ${HTTP_PROXY}
+      HTTPS_PROXY: ${HTTPS_PROXY}
+      http_proxy: ${HTTP_PROXY}
+      https_proxy: ${HTTPS_PROXY}
+
+      # Required for NVIDIA RAG ingestion server internals (MinIO is used at import/startup time)
+      # IMPORTANT: Do NOT use localhost here inside Docker. Use a resolvable hostname on the Docker network.
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ACCESSKEY: ${MINIO_ACCESSKEY}
+      MINIO_SECRETKEY: ${MINIO_SECRETKEY}
+      # Optional bucket name used by nv-ingest integrations (defaults inside the SDK if unset)
+      NVINGEST_MINIO_BUCKET: ${NVINGEST_MINIO_BUCKET}
     ports:
       - "8123:8123"
     depends_on:
       - owui-postgres 
     networks:
-      - default
+      - open-webui_default
       - nvidia-rag
 
 
   pipelines:
     image: ghcr.io/open-webui/pipelines:main
     environment:
+      HTTP_PROXY: ${HTTP_PROXY}
+      HTTPS_PROXY: ${HTTPS_PROXY}
+      https_proxy: ${HTTPS_PROXY}
       OPENWEBUI_BASE_URL: http://open-webui:8080
       OPENWEBUI_API_KEY: ${OPENWEBUI_API_KEY}
       NVIDIA_WORKER_URL: http://nvidia-rag-worker:8123
@@ -32,7 +49,7 @@ services:
     depends_on:
       - owui-postgres
     networks:
-      - default
+      - open-webui_default
       - nvidia-rag
 
   owui-postgres:
@@ -44,7 +61,7 @@ services:
     volumes:
       - owui_pg:/var/lib/postgresql/data
     networks:
-      - default
+      - open-webui_default
 
 volumes:
   owui_pg:
@@ -52,7 +69,7 @@ volumes:
   #open-webui:
 
 networks:
-  default:
+  open-webui_default:
     external: true
   nvidia-rag:
     external: true
