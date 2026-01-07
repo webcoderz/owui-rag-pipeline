@@ -16,9 +16,9 @@ services:
 
       # Required for NVIDIA RAG ingestion server internals (MinIO is used at import/startup time)
       # IMPORTANT: Do NOT use localhost here inside Docker. Use a resolvable hostname on the Docker network.
-      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
-      MINIO_ACCESSKEY: ${MINIO_ACCESSKEY}
-      MINIO_SECRETKEY: ${MINIO_SECRETKEY}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9010}
+      MINIO_ACCESSKEY: ${MINIO_ACCESSKEY:-minioadmin}
+      MINIO_SECRETKEY: ${MINIO_SECRETKEY:-minioadmin}
       # Optional bucket name used by nv-ingest integrations (defaults inside the SDK if unset)
       NVINGEST_MINIO_BUCKET: ${NVINGEST_MINIO_BUCKET}
     ports:
