@@ -2,7 +2,7 @@
 title: NVIDIA RAG (Worker • Postgres • Chat Allowlist • User Library • SSE)
 author: Cody Webb
 version: 1.2.0
-requirements: httpx, asyncpg
+requirements: httpx, psycopg[binary], psycopg_pool
 """
 
 import asyncio
@@ -14,10 +14,11 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-import asyncpg
 import httpx
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 
 def _now() -> int:
@@ -86,7 +87,7 @@ class Pipeline:
 
     def __init__(self):
         self.valves = self.Valves()
-        self._pool: Optional[asyncpg.Pool] = None
+        self._pool: Optional[AsyncConnectionPool] = None
 
     def pipes(self):
         return [{"id": "nvidia-rag-auto-ingest", "name": "NVIDIA RAG (Auto-Ingest • Library • Persistent)"}]
@@ -95,9 +96,19 @@ class Pipeline:
     # DB init + helpers
     # -----------------------
 
-    async def _db(self) -> asyncpg.Pool:
+    async def _db(self) -> AsyncConnectionPool:
         if not self._pool:
-            self._pool = await asyncpg.create_pool(self.valves.DATABASE_URL, min_size=1, max_size=10)
+            # NOTE: We use psycopg (psycopg3) instead of asyncpg because the Open WebUI
+            # pipelines image may run a Python version where asyncpg wheels aren't available,
+            # causing "no matching distribution" at startup.
+            self._pool = AsyncConnectionPool(
+                conninfo=self.valves.DATABASE_URL,
+                min_size=1,
+                max_size=10,
+                kwargs={"row_factory": dict_row},
+                open=False,
+            )
+            await self._pool.open()
             await self._init_db()
         return self._pool
 
@@ -105,7 +116,7 @@ class Pipeline:
         pool = self._pool
         if not pool:
             return
-        async with pool.acquire() as conn:
+        async with pool.connection() as conn:
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ingest_manifest (
@@ -187,11 +198,12 @@ class Pipeline:
 
     async def _allowlist_get(self, user_key: str, chat_id: str) -> List[str]:
         pool = await self._db()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT collection_name FROM chat_allowlist WHERE user_key=$1 AND chat_id=$2",
-                user_key, chat_id
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT collection_name FROM chat_allowlist WHERE user_key=%s AND chat_id=%s",
+                (user_key, chat_id),
             )
+            rows = await cur.fetchall()
         return [r["collection_name"] for r in rows]
 
     async def _allowlist_add(self, user_key: str, chat_id: str, collections: List[str]) -> None:
@@ -200,59 +212,65 @@ class Pipeline:
         pool = await self._db()
         now = _now()
         values = [(user_key, chat_id, c, now) for c in collections]
-        async with pool.acquire() as conn:
-            await conn.executemany(
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.executemany(
                 """
                 INSERT INTO chat_allowlist (user_key, chat_id, collection_name, added_at)
-                VALUES ($1, $2, $3, $4)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 """,
                 values
-            )
+                )
 
     async def _library_include_by_default(self, user_key: str) -> bool:
         pool = await self._db()
         now = _now()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT enabled, include_by_default FROM user_library_settings WHERE user_key=$1",
-                user_key
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT enabled, include_by_default FROM user_library_settings WHERE user_key=%s",
+                (user_key,),
             )
+            row = await cur.fetchone()
             if row:
                 return bool(row["enabled"]) and bool(row["include_by_default"])
             await conn.execute(
                 """
                 INSERT INTO user_library_settings (user_key, enabled, include_by_default, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $4)
+                VALUES (%s, %s, %s, %s, %s)
                 """,
-                user_key,
-                bool(self.valves.LIBRARY_ENABLED_DEFAULT),
-                bool(self.valves.LIBRARY_INCLUDE_BY_DEFAULT),
-                now
+                (
+                    user_key,
+                    bool(self.valves.LIBRARY_ENABLED_DEFAULT),
+                    bool(self.valves.LIBRARY_INCLUDE_BY_DEFAULT),
+                    now,
+                    now,
+                ),
             )
             return bool(self.valves.LIBRARY_ENABLED_DEFAULT) and bool(self.valves.LIBRARY_INCLUDE_BY_DEFAULT)
 
     async def _chat_get_save_to_library(self, user_key: str, chat_id: str) -> bool:
         pool = await self._db()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT save_to_library FROM chat_settings WHERE user_key=$1 AND chat_id=$2",
-                user_key, chat_id
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT save_to_library FROM chat_settings WHERE user_key=%s AND chat_id=%s",
+                (user_key, chat_id),
             )
+            row = await cur.fetchone()
         return bool(row["save_to_library"]) if row else False
 
     async def _chat_set_save_to_library(self, user_key: str, chat_id: str, value: bool) -> None:
         pool = await self._db()
         now = _now()
-        async with pool.acquire() as conn:
+        async with pool.connection() as conn:
             await conn.execute(
                 """
                 INSERT INTO chat_settings (user_key, chat_id, save_to_library, updated_at)
-                VALUES ($1, $2, $3, $4)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (user_key, chat_id)
                 DO UPDATE SET save_to_library=EXCLUDED.save_to_library, updated_at=EXCLUDED.updated_at
                 """,
-                user_key, chat_id, value, now
+                (user_key, chat_id, value, now),
             )
 
     # -----------------------
@@ -261,36 +279,38 @@ class Pipeline:
 
     async def _manifest_get_status(self, file_id: str, collection: str, sha: str) -> Optional[str]:
         pool = await self._db()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT status FROM ingest_manifest WHERE file_id=$1 AND collection_name=$2 AND sha256=$3",
-                file_id, collection, sha
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT status FROM ingest_manifest WHERE file_id=%s AND collection_name=%s AND sha256=%s",
+                (file_id, collection, sha),
             )
+            row = await cur.fetchone()
         return row["status"] if row else None
 
     async def _manifest_try_claim(self, file_id: str, collection: str, sha: str) -> bool:
         pool = await self._db()
-        async with pool.acquire() as conn:
-            res = await conn.execute(
+        async with pool.connection() as conn:
+            cur = await conn.execute(
                 """
                 INSERT INTO ingest_manifest (file_id, collection_name, sha256, status, updated_at)
-                VALUES ($1, $2, $3, 'pending', $4)
+                VALUES (%s, %s, %s, 'pending', %s)
                 ON CONFLICT (file_id, collection_name, sha256) DO NOTHING
                 """,
-                file_id, collection, sha, _now()
+                (file_id, collection, sha, _now()),
             )
-        return res.endswith("1")
+            # psycopg returns a cursor; `rowcount` is the number of inserted rows.
+            return bool(getattr(cur, "rowcount", 0))
 
     async def _manifest_set(self, file_id: str, collection: str, sha: str, status: str) -> None:
         pool = await self._db()
-        async with pool.acquire() as conn:
+        async with pool.connection() as conn:
             await conn.execute(
                 """
                 UPDATE ingest_manifest
-                SET status=$4, updated_at=$5
-                WHERE file_id=$1 AND collection_name=$2 AND sha256=$3
+                SET status=%s, updated_at=%s
+                WHERE file_id=%s AND collection_name=%s AND sha256=%s
                 """,
-                file_id, collection, sha, status, _now()
+                (status, _now(), file_id, collection, sha),
             )
 
     async def _wait_for_terminal(self, file_id: str, collection: str, sha: str) -> Optional[str]:
