@@ -551,6 +551,30 @@ class Pipeline:
                 # otherwise fall back to the last user message in the chat payload.
                 text = ((user_message or last_user_text) or "").strip().lower()
                 if text:
+                    # Help/commands
+                    if text in ("/commands", "/help", "/?"):
+                        yield _sse_chunk(
+                            model_id,
+                            "Commands:\n"
+                            "- `/library on` — save future ingests to your library\n"
+                            "- `/library off` — do not save future ingests to your library\n"
+                            "- `/library` — show this chat's current save-to-library setting\n"
+                            "- `/commands` — show this help\n",
+                        )
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    # Show current setting
+                    if text == "/library":
+                        current = await self._chat_get_save_to_library(user_key, chat_id)
+                        yield _sse_chunk(
+                            model_id,
+                            "📚 Library setting for this chat: "
+                            + ("ON (new ingests will be saved to your library)\n" if current else "OFF (new ingests will NOT be saved to your library)\n"),
+                        )
+                        yield "data: [DONE]\n\n"
+                        return
+
                     if text in ("/library on", "/library true", "/library enable"):
                         await self._chat_set_save_to_library(user_key, chat_id, True)
                         yield _sse_chunk(model_id, "✅ This chat will save new ingests to your library.\n")
@@ -559,6 +583,17 @@ class Pipeline:
                     if text in ("/library off", "/library false", "/library disable"):
                         await self._chat_set_save_to_library(user_key, chat_id, False)
                         yield _sse_chunk(model_id, "✅ This chat will NOT save new ingests to your library.\n")
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    # If a user types a slash command we don't recognize, respond explicitly so it's obvious
+                    # whether the Pipeline is running.
+                    if text.startswith("/"):
+                        yield _sse_chunk(
+                            model_id,
+                            f"❓ Unknown command: `{text}`\n"
+                            "Try `/commands`.\n",
+                        )
                         yield "data: [DONE]\n\n"
                         return
 
