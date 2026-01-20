@@ -1,0 +1,21 @@
+FROM python:3.12-slim
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY}
+ENV HTTPS_PROXY=${HTTPS_PROXY}
+ENV http_proxy=${HTTP_PROXY}
+ENV https_proxy=${HTTPS_PROXY}
+ENV PIP_OPTIONS="--proxy ${HTTP_PROXY} --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host  pypi.python.org --no-cache-dir"
+
+WORKDIR /app
+
+# Minimal runtime deps for a tools server
+RUN pip install $PIP_OPTIONS fastapi uvicorn[standard] asyncpg
+
+COPY owui_rag_tools.py /app/owui_rag_tools.py
+
+EXPOSE 8181
+
+CMD ["uvicorn", "owui_rag_tools:app", "--host", "0.0.0.0", "--port", "8181"]
+

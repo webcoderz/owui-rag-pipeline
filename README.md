@@ -93,6 +93,19 @@ Requirements for connectivity:
 - The pipelines container can reach `open-webui` at `OPENWEBUI_BASE_URL`.
 - The worker and pipelines can reach `milvus` at `VDB_ENDPOINT`.
 
+## (Optional) Add Tools (recommended for production UX)
+This repo includes an OpenAPI tools server (`owui-rag-tools`) so you can promote “commands” into real Open WebUI tools (discoverable + schema’d).
+
+In Open WebUI (Admin → Settings → Tools / OpenAPI Servers):
+- Add OpenAPI server URL: `http://owui-rag-tools:8181/openapi.json`
+- Enable the tools for the model(s) you want (e.g. your main chat model)
+
+Available tools:
+- `POST /library/set` — toggle per-chat “save to library”
+- `GET /library/status` — read current setting
+- `POST /allowlist/add` — add collection(s) to the chat allowlist
+- `GET /allowlist/list` — list allowlisted collections
+
 ## Using it in chats
 In Open WebUI:
 1. Start a chat and select the pipeline tool “NVIDIA RAG (Auto-Ingest • Library • Persistent)”.

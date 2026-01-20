@@ -60,6 +60,20 @@ services:
       - open-webui_default
       - nvidia-rag
 
+  owui-rag-tools:
+    build:
+      context: ./docker/tools
+      dockerfile: Dockerfile.tools
+    environment:
+      DATABASE_URL: postgresql://owui:owui@owui-postgres:5432/owui_bridge
+    ports:
+      - "8181:8181"
+    depends_on:
+      - owui-postgres
+    networks:
+      - open-webui_default
+      - nvidia-rag
+
   owui-postgres:
     image: postgres:16
     environment:
