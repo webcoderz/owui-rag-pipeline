@@ -157,7 +157,24 @@ def _load_pipeline_module():
 
 
 async def _collect_streaming_text(response):
-    # Wrap StreamingResponse inside a tiny ASGI app to collect output
+    # The pipeline `pipe()` may return:
+    # - a dict (non-stream)
+    # - a sync generator yielding SSE lines (stream)
+    # - a StreamingResponse (older behavior)
+    if isinstance(response, dict):
+        return json.dumps(response)
+
+    if hasattr(response, "__iter__") and not hasattr(response, "__aiter__"):
+        chunks = []
+        for i, chunk in enumerate(response):
+            chunks.append(chunk)
+            if "data: [DONE]" in chunk:
+                break
+            if i > 500:
+                break
+        return "".join(chunks)
+
+    # Fallback: wrap StreamingResponse inside a tiny ASGI app to collect output
     app = FastAPI()
 
     @app.get("/pipe")
@@ -185,6 +202,46 @@ def test_pipe_no_api_key(monkeypatch):
     text = anyio.run(lambda: _collect_streaming_text(resp))
     assert "OPENWEBUI_API_KEY is not set" in text
     assert "data: [DONE]" in text
+
+
+def test_pipe_commands(monkeypatch):
+    module = _load_pipeline_module()
+    p = module.Pipeline()
+    p.valves.OPENWEBUI_API_KEY = "token"
+
+    body = {"messages": [{"role": "user", "content": "/commands"}], "stream": True}
+    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "u"}))
+    text = anyio.run(lambda: _collect_streaming_text(resp))
+    assert "Commands:" in text
+    assert "data: [DONE]" in text
+
+
+def test_pipe_library_toggle(monkeypatch):
+    module = _load_pipeline_module()
+    p = module.Pipeline()
+    p.valves.OPENWEBUI_API_KEY = "token"
+
+    # Stub chat settings to keep test isolated
+    state = {"val": False}
+
+    async def stub_get(user_key: str, chat_id: str):
+        return state["val"]
+
+    async def stub_set(user_key: str, chat_id: str, value: bool):
+        state["val"] = bool(value)
+
+    monkeypatch.setattr(p, "_chat_get_save_to_library", stub_get)
+    monkeypatch.setattr(p, "_chat_set_save_to_library", stub_set)
+
+    body_on = {"messages": [{"role": "user", "content": "/library on"}], "stream": True, "chat_id": "c1"}
+    resp_on = anyio.run(lambda: p.pipe(body=body_on, __user__={"id": "u"}))
+    text_on = anyio.run(lambda: _collect_streaming_text(resp_on))
+    assert "save new ingests" in text_on.lower()
+
+    body_status = {"messages": [{"role": "user", "content": "/library"}], "stream": True, "chat_id": "c1"}
+    resp_st = anyio.run(lambda: p.pipe(body=body_status, __user__={"id": "u"}))
+    text_st = anyio.run(lambda: _collect_streaming_text(resp_st))
+    assert "library setting" in text_st.lower()
 
 
 def test_pipe_ingest_and_generate(monkeypatch, tmp_path):

@@ -710,21 +710,137 @@ class Pipeline:
             if stream:
                 return _sync_stream_from_async(library_cmd_stream())
 
-            # Non-stream response
-            try:
-                if text == "/library":
-                    current = asyncio.run(self._chat_get_save_to_library(user_key, chat_id))
-                    msg = (
-                        "Library setting for this chat: ON (new ingests will be saved to your library)."
-                        if current
-                        else "Library setting for this chat: OFF (new ingests will NOT be saved to your library)."
-                    )
-                    return _json_completion(model_id, msg)
-                enable = text in ("/library on", "/library true", "/library enable")
-                asyncio.run(self._chat_set_save_to_library(user_key, chat_id, enable))
-                return _json_completion(model_id, "Library enabled for this chat." if enable else "Library disabled for this chat.")
-            except Exception as e:
-                return _json_completion(model_id, f"Library command failed: {e}")
+            # Non-stream is not supported reliably here (would require awaiting DB calls).
+            # Return a friendly message instead of risking "asyncio.run() cannot be called from a running event loop".
+            return _json_completion(model_id, "This command is supported in streaming mode. Please retry with stream=true.")
+
+        # /ingest: ingest current attachments/KBs and stop (no generation)
+        if text == "/ingest":
+            async def ingest_only_stream():
+                yield _sse_chunk(model_id, role="assistant")
+
+                if not self.valves.OPENWEBUI_API_KEY:
+                    yield _sse_chunk(model_id, "❌ OPENWEBUI_API_KEY is not set. Cannot access OWUI files/knowledge.\n")
+                    yield _sse_done(model_id)
+                    return
+
+                files = body.get("files") or []
+                if not files:
+                    yield _sse_chunk(model_id, "📎 No attachments/knowledge selected for ingestion.\n")
+                    yield _sse_done(model_id)
+                    return
+
+                status_q: asyncio.Queue[str] = asyncio.Queue()
+
+                async def emit(msg: str):
+                    await status_q.put(_sse_chunk(model_id, msg))
+
+                async def do_ingest():
+                    async with httpx.AsyncClient() as ow_client, httpx.AsyncClient() as worker_client:
+                        adhoc_file_ids, kb_ids = self._split_refs(files)
+
+                        # KB files
+                        for kb_id in kb_ids:
+                            kb_meta = await self._ow_get_json(ow_client, f"/api/v1/knowledge/{kb_id}")
+                            kb_collection = self._kb_collection_name(kb_id, kb_meta)
+                            await emit(f"📚 Knowledge `{kb_id}` → `{kb_collection}`\n")
+
+                            kb_files = kb_meta.get("files") or []
+                            entries: List[Tuple[str, str]] = []
+                            for f in kb_files:
+                                fid = f.get("id") or f.get("file_id")
+                                if not fid:
+                                    continue
+                                fname = f.get("filename") or f.get("name") or fid
+                                entries.append((fid, fname))
+                            await emit(f"📥 KB files: {len(entries)}\n")
+
+                            await self._ingest_entries_into_collection(
+                                ow_client, worker_client, entries, kb_collection, emit, model_id
+                            )
+
+                        # Ad-hoc files
+                        if adhoc_file_ids:
+                            chat_collection = self._chat_collection_name(chat_id, user)
+                            await emit(f"📥 Chat uploads → `{chat_collection}`\n")
+                            entries2: List[Tuple[str, str]] = []
+                            for fid in adhoc_file_ids:
+                                meta = await self._ow_get_json(ow_client, f"/api/v1/files/{fid}")
+                                fname = meta.get("filename") or meta.get("name") or fid
+                                entries2.append((fid, fname))
+                            await emit(f"📥 Uploads: {len(entries2)}\n")
+                            await self._ingest_entries_into_collection(
+                                ow_client, worker_client, entries2, chat_collection, emit, model_id
+                            )
+
+                task = asyncio.create_task(do_ingest())
+                try:
+                    while True:
+                        try:
+                            item = await asyncio.wait_for(status_q.get(), timeout=0.2)
+                            yield item
+                        except asyncio.TimeoutError:
+                            if task.done():
+                                break
+
+                    # Drain remaining
+                    while not status_q.empty():
+                        yield await status_q.get()
+
+                    # Propagate errors if any
+                    exc = task.exception()
+                    if exc:
+                        yield _sse_chunk(model_id, f"❌ Ingestion failed: {exc}\n")
+                    else:
+                        yield _sse_chunk(model_id, "✅ Ingestion complete.\n")
+                finally:
+                    yield _sse_done(model_id)
+
+            if stream:
+                return _sync_stream_from_async(ingest_only_stream())
+            return _json_completion(model_id, "Use stream=true for /ingest (streaming status).")
+
+        # /query: run a question against specific collections without ingesting
+        if text.startswith("/query"):
+            # preserve original casing/content for the query
+            raw = (user_message or last_user_text or "").strip()
+            query = raw[len("/query") :].strip()
+            if not query:
+                return _json_completion(model_id, "Usage: /query <question>")
+
+            async def query_stream():
+                yield _sse_chunk(model_id, role="assistant")
+                if not self.valves.OPENWEBUI_API_KEY:
+                    # Not strictly needed for querying, but keep consistent error surface
+                    yield _sse_chunk(model_id, "❌ OPENWEBUI_API_KEY is not set.\n")
+                    yield _sse_done(model_id)
+                    return
+
+                # Determine collections: use remembered allowlist + (optional) library include by default.
+                remembered = await self._allowlist_get(user_key, chat_id)
+                collection_names: List[str] = list(dict.fromkeys(remembered))
+                lib_collection = self._library_collection_name(user_key)
+                if await self._library_include_by_default(user_key):
+                    collection_names.append(lib_collection)
+                    collection_names = list(dict.fromkeys(collection_names))
+
+                # Build messages: replace last user message content with the query
+                q_messages = list(messages)
+                if q_messages and q_messages[-1].get("role") == "user":
+                    q_messages[-1] = {"role": "user", "content": query}
+                else:
+                    q_messages.append({"role": "user", "content": query})
+
+                async with httpx.AsyncClient() as worker_client:
+                    async for line in self._stream_worker_generate(worker_client, q_messages, collection_names):
+                        parsed = _parse_worker_sse_line(model_id, line)
+                        if parsed is not None:
+                            yield parsed
+                yield _sse_done(model_id)
+
+            if stream:
+                return _sync_stream_from_async(query_stream())
+            return _json_completion(model_id, "Use stream=true for /query.")
 
         if text.startswith("/"):
             msg = f"Unknown command: {text}. Try /commands."
