@@ -8,6 +8,7 @@ requirements: httpx, asyncpg
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import time
@@ -16,8 +17,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 import httpx
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> int:
@@ -554,6 +557,16 @@ class Pipeline:
         text = ((user_message or last_user_text) or "").strip().lower()
         stream = bool(body.get("stream", True))
 
+        # Minimal debug to confirm OWUI payload shape without logging secrets/content.
+        # Enable by setting PIPE_DEBUG=true in the pipelines container env.
+        if (os.getenv("PIPE_DEBUG", "").lower() in ("1", "true", "yes")):
+            logger.warning(
+                "pipe called stream=%s text=%r body_keys=%s",
+                stream,
+                text,
+                sorted(list(body.keys())),
+            )
+
         async def runner():
             yield _sse_chunk(model_id, role="assistant")
 
@@ -732,29 +745,24 @@ class Pipeline:
 
                 yield "data: [DONE]\n\n"
 
-        # If Open WebUI calls us with stream=false, return a normal JSON completion.
-        # This is important because OWUI/pipelines may issue non-stream calls for some UI actions.
+        # IMPORTANT: Open WebUI Pipelines expects the Pipeline.pipe() method to return either:
+        # - a plain dict for non-stream responses, OR
+        # - a (async) generator for stream responses.
+        # Returning a Starlette/FastAPI Response object here can be ignored by the Pipelines runtime.
         if not stream:
             if text in ("/commands", "/help", "/?"):
-                return JSONResponse(
-                    _json_completion(
-                        model_id,
-                        "Commands:\n"
-                        "- /library on — save future ingests to your library\n"
-                        "- /library off — do not save future ingests to your library\n"
-                        "- /library — show this chat's current save-to-library setting\n"
-                        "- /commands — show this help\n",
-                    )
-                )
-            if text == "/library":
-                # Can't await here; respond with guidance. (User-facing calls should be stream=true.)
-                return JSONResponse(
-                    _json_completion(
-                        model_id,
-                        "This command requires streaming mode in this pipeline. Re-try with `stream=true` (default).",
-                    )
+                return _json_completion(
+                    model_id,
+                    "Commands:\n"
+                    "- /library on — save future ingests to your library\n"
+                    "- /library off — do not save future ingests to your library\n"
+                    "- /library — show this chat's current save-to-library setting\n"
+                    "- /commands — show this help\n",
                 )
             if text.startswith("/"):
-                return JSONResponse(_json_completion(model_id, f"Unknown command: {text}. Try /commands."))
+                return _json_completion(model_id, f"Unknown command: {text}. Try /commands.")
+            # Default non-stream fallback: tell OWUI we stream by default.
+            return _json_completion(model_id, "This pipeline is configured for streaming responses.")
 
-        return StreamingResponse(runner(), media_type="text/event-stream")
+        # Stream path: return the async generator directly (Pipelines runtime will stream it).
+        return runner()
