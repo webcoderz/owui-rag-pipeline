@@ -567,61 +567,27 @@ class Pipeline:
                 sorted(list(body.keys())),
             )
 
+        # IMPORTANT:
+        # Open WebUI may call with stream=true, but for short slash-commands it's more reliable
+        # to return a non-stream JSON completion directly (so the UI always renders something).
+        if text in ("/commands", "/help", "/?"):
+            return _json_completion(
+                model_id,
+                "Commands:\n"
+                "- /library on — save future ingests to your library\n"
+                "- /library off — do not save future ingests to your library\n"
+                "- /library — show this chat's current save-to-library setting\n"
+                "- /commands — show this help\n",
+            )
+
+        if text.startswith("/"):
+            return _json_completion(model_id, f"Unknown command: {text}. Try /commands.")
+
         async def runner():
             yield _sse_chunk(model_id, role="assistant")
 
             # Command handling (these won't show as UI autocomplete; we respond explicitly)
-            if text in ("/commands", "/help", "/?"):
-                yield _sse_chunk(
-                    model_id,
-                    "Commands:\n"
-                    "- `/library on` — save future ingests to your library\n"
-                    "- `/library off` — do not save future ingests to your library\n"
-                    "- `/library` — show this chat's current save-to-library setting\n"
-                    "- `/commands` — show this help\n",
-                )
-                yield "data: [DONE]\n\n"
-                return
-
-            if text == "/library":
-                try:
-                    current = await self._chat_get_save_to_library(user_key, chat_id)
-                    yield _sse_chunk(
-                        model_id,
-                        "📚 Library setting for this chat: "
-                        + (
-                            "ON (new ingests will be saved to your library)\n"
-                            if current
-                            else "OFF (new ingests will NOT be saved to your library)\n"
-                        ),
-                    )
-                except Exception as e:
-                    yield _sse_chunk(model_id, f"❌ Failed to read library setting: {e}\n")
-                yield "data: [DONE]\n\n"
-                return
-
-            if text in ("/library on", "/library true", "/library enable"):
-                try:
-                    await self._chat_set_save_to_library(user_key, chat_id, True)
-                    yield _sse_chunk(model_id, "✅ This chat will save new ingests to your library.\n")
-                except Exception as e:
-                    yield _sse_chunk(model_id, f"❌ Failed to set library ON: {e}\n")
-                yield "data: [DONE]\n\n"
-                return
-
-            if text in ("/library off", "/library false", "/library disable"):
-                try:
-                    await self._chat_set_save_to_library(user_key, chat_id, False)
-                    yield _sse_chunk(model_id, "✅ This chat will NOT save new ingests to your library.\n")
-                except Exception as e:
-                    yield _sse_chunk(model_id, f"❌ Failed to set library OFF: {e}\n")
-                yield "data: [DONE]\n\n"
-                return
-
-            if text.startswith("/"):
-                yield _sse_chunk(model_id, f"❓ Unknown command: `{text}`\nTry `/commands`.\n")
-                yield "data: [DONE]\n\n"
-                return
+            # (slash commands handled above via non-stream JSON return)
 
             if not self.valves.OPENWEBUI_API_KEY:
                 yield _sse_chunk(model_id, "❌ OPENWEBUI_API_KEY is not set. Cannot access OWUI files/knowledge.\n")
