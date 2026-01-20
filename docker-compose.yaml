@@ -21,6 +21,14 @@ services:
       MINIO_SECRETKEY: ${MINIO_SECRETKEY:-minioadmin}
       # Optional bucket name used by nv-ingest integrations (defaults inside the SDK if unset)
       NVINGEST_MINIO_BUCKET: ${NVINGEST_MINIO_BUCKET}
+
+      # Optional: use your own OpenAI-compatible (vLLM) model for final generation instead of NVIDIA generation
+      # - nvidia: uses NvidiaRAG.generate() (default)
+      # - openai/vllm: uses NvidiaRAG.search() for retrieval, then calls OPENAI_BASE_URL with OPENAI_MODEL
+      GENERATION_BACKEND: ${GENERATION_BACKEND:-nvidia}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
     ports:
       - "8123:8123"
     depends_on:
