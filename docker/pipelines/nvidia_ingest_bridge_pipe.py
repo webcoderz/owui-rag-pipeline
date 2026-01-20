@@ -10,7 +10,9 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -594,6 +596,45 @@ class Pipeline:
                 sorted(list(body.keys())),
             )
 
+        def _sync_stream_from_async(async_gen):
+            """
+            Pipelines' /chat/completions streamer in some deployments does NOT iterate async generators.
+            It expects a *sync* iterator yielding strings.
+            We bridge an async generator -> sync generator using a background thread + queue.
+            """
+            q: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=256)
+
+            def _runner():
+                async def _consume():
+                    try:
+                        async for item in async_gen:
+                            q.put(item)
+                    finally:
+                        q.put(None)
+
+                try:
+                    asyncio.run(_consume())
+                except Exception as e:
+                    # Emit an error chunk so the client sees something.
+                    try:
+                        q.put(_sse_chunk(model_id, f"❌ Pipeline stream error: {e}\n"))
+                    except Exception:
+                        pass
+                    q.put(_sse_done(model_id))
+                    q.put(None)
+
+            t = threading.Thread(target=_runner, daemon=True)
+            t.start()
+
+            def _iter():
+                while True:
+                    item = q.get()
+                    if item is None:
+                        break
+                    yield item
+
+            return _iter()
+
         commands_text = (
             "Commands:\n"
             "- /library on — save future ingests to your library\n"
@@ -613,7 +654,7 @@ class Pipeline:
                     yield _sse_chunk(model_id, role="assistant")
                     yield _sse_chunk(model_id, commands_text)
                     yield _sse_done(model_id)
-                return cmd_stream()
+                return _sync_stream_from_async(cmd_stream())
             return _json_completion(model_id, commands_text)
 
         if text.startswith("/"):
@@ -623,7 +664,7 @@ class Pipeline:
                     yield _sse_chunk(model_id, role="assistant")
                     yield _sse_chunk(model_id, msg + "\n")
                     yield _sse_done(model_id)
-                return unknown_stream()
+                return _sync_stream_from_async(unknown_stream())
             return _json_completion(model_id, msg)
 
         async def runner():
@@ -774,5 +815,5 @@ class Pipeline:
             # Default non-stream fallback: tell OWUI we stream by default.
             return _json_completion(model_id, "This pipeline is configured for streaming responses.")
 
-        # Stream path: return the async generator directly (Pipelines runtime will stream it).
-        return runner()
+        # Stream path: return a *sync* generator (some Pipelines deployments don't iterate async generators).
+        return _sync_stream_from_async(runner())
