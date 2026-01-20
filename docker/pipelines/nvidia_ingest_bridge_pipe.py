@@ -135,7 +135,31 @@ class Pipeline:
 
     def __init__(self):
         self.valves = self.Valves()
+        # Open WebUI Pipelines persists "valves" to a JSON file and may not hydrate from
+        # container env vars automatically. In production we want env vars to win.
+        self._apply_env_valves_overrides()
         self._pool: Optional[asyncpg.Pool] = None
+
+    def _apply_env_valves_overrides(self) -> None:
+        def set_if_env(name: str, caster=lambda x: x):
+            v = os.getenv(name)
+            if v is None or v == "":
+                return
+            try:
+                setattr(self.valves, name, caster(v))
+            except Exception:
+                # best-effort; ignore bad env values
+                return
+
+        set_if_env("OPENWEBUI_BASE_URL", str)
+        set_if_env("OPENWEBUI_API_KEY", str)
+        set_if_env("NVIDIA_WORKER_URL", str)
+        set_if_env("VDB_ENDPOINT", str)
+        set_if_env("DATABASE_URL", str)
+        set_if_env("MAX_PARALLEL_FILE_INGEST", int)
+        set_if_env("PENDING_WAIT_SECONDS", int)
+        set_if_env("CHUNK_SIZE", int)
+        set_if_env("CHUNK_OVERLAP", int)
 
     def pipes(self):
         return [{"id": "nvidia-rag-auto-ingest", "name": "NVIDIA RAG (Auto-Ingest • Library • Persistent)"}]
