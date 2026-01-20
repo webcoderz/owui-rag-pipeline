@@ -27,7 +27,7 @@ def _now() -> int:
     return int(time.time())
 
 
-def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> str:
+def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> dict:
     delta: Dict[str, Any] = {}
     if role:
         delta["role"] = role
@@ -40,7 +40,41 @@ def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> str
         "model": model or "nvidia-rag-auto-ingest",
         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
     }
-    return f"data: {json.dumps(payload)}\n\n"
+    return payload
+
+
+def _sse_done(model: str) -> dict:
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion.chunk",
+        "created": _now(),
+        "model": model or "nvidia-rag-auto-ingest",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+
+
+def _parse_worker_sse_line(model: str, line: str) -> Optional[dict]:
+    """
+    Worker streams OpenAI-style SSE lines. The Pipelines runtime usually handles SSE framing,
+    so we convert lines to chunk dicts here.
+    """
+    if not line:
+        return None
+    line = line.strip()
+    if not line:
+        return None
+    if line.startswith("data:"):
+        line = line[len("data:") :].strip()
+    if not line or line == "[DONE]":
+        return _sse_done(model)
+    try:
+        obj = json.loads(line)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    # Fallback: treat as plain text content
+    return _sse_chunk(model, content=line)
 
 
 def _json_completion(model: str, content: str) -> dict:
@@ -583,7 +617,7 @@ class Pipeline:
                 async def cmd_stream():
                     yield _sse_chunk(model_id, role="assistant")
                     yield _sse_chunk(model_id, commands_text)
-                    yield "data: [DONE]\n\n"
+                    yield _sse_done(model_id)
                 return cmd_stream()
             return _json_completion(model_id, commands_text)
 
@@ -593,7 +627,7 @@ class Pipeline:
                 async def unknown_stream():
                     yield _sse_chunk(model_id, role="assistant")
                     yield _sse_chunk(model_id, msg + "\n")
-                    yield "data: [DONE]\n\n"
+                    yield _sse_done(model_id)
                 return unknown_stream()
             return _json_completion(model_id, msg)
 
@@ -605,10 +639,10 @@ class Pipeline:
 
             if not self.valves.OPENWEBUI_API_KEY:
                 yield _sse_chunk(model_id, "❌ OPENWEBUI_API_KEY is not set. Cannot access OWUI files/knowledge.\n")
-                yield "data: [DONE]\n\n"
+                yield _sse_done(model_id)
                 return
 
-            status_q: asyncio.Queue[str] = asyncio.Queue()
+            status_q: asyncio.Queue[dict] = asyncio.Queue()
 
             async def emit(msg: str):
                 await status_q.put(_sse_chunk(model_id, msg))
@@ -715,15 +749,14 @@ class Pipeline:
                     line = line.strip()
                     if not line:
                         continue
-                    if line.startswith("data:"):
-                        yield line + "\n\n"
-                    else:
-                        yield "data: " + line + "\n\n"
+                    parsed = _parse_worker_sse_line(model_id, line)
+                    if parsed is not None:
+                        yield parsed
 
                 while not status_q.empty():
                     yield await status_q.get()
 
-                yield "data: [DONE]\n\n"
+                yield _sse_done(model_id)
 
         # IMPORTANT: Open WebUI Pipelines expects the Pipeline.pipe() method to return either:
         # - a plain dict for non-stream responses, OR
