@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 import httpx
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 
@@ -38,6 +38,23 @@ def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> str
         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
     }
     return f"data: {json.dumps(payload)}\n\n"
+
+
+def _json_completion(model: str, content: str) -> dict:
+    """Non-stream OpenAI-style response payload."""
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": _now(),
+        "model": model or "nvidia-rag-auto-ingest",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
 
 
 class Pipeline:
@@ -535,6 +552,7 @@ class Pipeline:
         if messages and (messages[-1].get("role") == "user"):
             last_user_text = (messages[-1].get("content") or "")
         text = ((user_message or last_user_text) or "").strip().lower()
+        stream = bool(body.get("stream", True))
 
         async def runner():
             yield _sse_chunk(model_id, role="assistant")
@@ -713,5 +731,30 @@ class Pipeline:
                     yield await status_q.get()
 
                 yield "data: [DONE]\n\n"
+
+        # If Open WebUI calls us with stream=false, return a normal JSON completion.
+        # This is important because OWUI/pipelines may issue non-stream calls for some UI actions.
+        if not stream:
+            if text in ("/commands", "/help", "/?"):
+                return JSONResponse(
+                    _json_completion(
+                        model_id,
+                        "Commands:\n"
+                        "- /library on — save future ingests to your library\n"
+                        "- /library off — do not save future ingests to your library\n"
+                        "- /library — show this chat's current save-to-library setting\n"
+                        "- /commands — show this help\n",
+                    )
+                )
+            if text == "/library":
+                # Can't await here; respond with guidance. (User-facing calls should be stream=true.)
+                return JSONResponse(
+                    _json_completion(
+                        model_id,
+                        "This command requires streaming mode in this pipeline. Re-try with `stream=true` (default).",
+                    )
+                )
+            if text.startswith("/"):
+                return JSONResponse(_json_completion(model_id, f"Unknown command: {text}. Try /commands."))
 
         return StreamingResponse(runner(), media_type="text/event-stream")
