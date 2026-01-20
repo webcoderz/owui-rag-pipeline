@@ -657,6 +657,51 @@ class Pipeline:
                 return _sync_stream_from_async(cmd_stream())
             return _json_completion(model_id, commands_text)
 
+        # /library helpers (per-chat toggle)
+        if text in ("/library", "/library on", "/library off", "/library true", "/library false", "/library enable", "/library disable"):
+            async def library_cmd_stream():
+                yield _sse_chunk(model_id, role="assistant")
+                try:
+                    if text == "/library":
+                        current = await self._chat_get_save_to_library(user_key, chat_id)
+                        msg = (
+                            "📚 Library setting for this chat: ON (new ingests will be saved to your library)\n"
+                            if current
+                            else "📚 Library setting for this chat: OFF (new ingests will NOT be saved to your library)\n"
+                        )
+                        yield _sse_chunk(model_id, msg)
+                        yield _sse_done(model_id)
+                        return
+
+                    enable = text in ("/library on", "/library true", "/library enable")
+                    await self._chat_set_save_to_library(user_key, chat_id, enable)
+                    yield _sse_chunk(
+                        model_id,
+                        "✅ This chat will save new ingests to your library.\n" if enable else "✅ This chat will NOT save new ingests to your library.\n",
+                    )
+                except Exception as e:
+                    yield _sse_chunk(model_id, f"❌ Library command failed: {e}\n")
+                yield _sse_done(model_id)
+
+            if stream:
+                return _sync_stream_from_async(library_cmd_stream())
+
+            # Non-stream response
+            try:
+                if text == "/library":
+                    current = asyncio.run(self._chat_get_save_to_library(user_key, chat_id))
+                    msg = (
+                        "Library setting for this chat: ON (new ingests will be saved to your library)."
+                        if current
+                        else "Library setting for this chat: OFF (new ingests will NOT be saved to your library)."
+                    )
+                    return _json_completion(model_id, msg)
+                enable = text in ("/library on", "/library true", "/library enable")
+                asyncio.run(self._chat_set_save_to_library(user_key, chat_id, enable))
+                return _json_completion(model_id, "Library enabled for this chat." if enable else "Library disabled for this chat.")
+            except Exception as e:
+                return _json_completion(model_id, f"Library command failed: {e}")
+
         if text.startswith("/"):
             msg = f"Unknown command: {text}. Try /commands."
             if stream:
