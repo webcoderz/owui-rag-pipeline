@@ -54,6 +54,15 @@ def _normalize_openai_base_url(url: str) -> str:
     return url
 
 
+def _openai_headers(api_key: str) -> Dict[str, str]:
+    return {"Authorization": f"Bearer {api_key or 'dummy'}"}
+
+
+def _openai_models_url(base_url: str) -> str:
+    base = _normalize_openai_base_url(base_url)
+    return f"{base}/models" if base else ""
+
+
 def _extract_search_results_text(citations_obj: Any, max_chars: int = 12000) -> str:
     """
     Best-effort extraction of plain-text context from nvidia_rag citations/search results.
@@ -133,6 +142,39 @@ def _stream_openai_chat_completions(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """
+    Readiness check for production:
+    - Confirms required env is present for the selected generation backend
+    - Optionally checks OpenAI/vLLM endpoint connectivity
+    """
+    backend = (os.getenv("GENERATION_BACKEND") or "nvidia").strip().lower()
+    status: Dict[str, Any] = {"status": "ok", "generation_backend": backend}
+
+    if backend in ("openai", "vllm"):
+        base_url = os.getenv("OPENAI_BASE_URL", "")
+        model = os.getenv("OPENAI_MODEL", "")
+        api_key = os.getenv("OPENAI_API_KEY", "dummy")
+
+        if not base_url:
+            return JSONResponse({"status": "error", "error": "OPENAI_BASE_URL is not set"}, status_code=500)
+        if not model:
+            return JSONResponse({"status": "error", "error": "OPENAI_MODEL is not set"}, status_code=500)
+
+        try:
+            url = _openai_models_url(base_url)
+            r = requests.get(url, headers=_openai_headers(api_key), timeout=5)
+            status["openai_models_status_code"] = r.status_code
+        except Exception as e:
+            return JSONResponse(
+                {"status": "error", "error": f"OpenAI/vLLM connectivity check failed: {e}"},
+                status_code=500,
+            )
+
+    return status
 
 
 @app.post("/ingest")

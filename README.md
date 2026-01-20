@@ -45,6 +45,13 @@ MINIO_ACCESSKEY=minioadmin
 MINIO_SECRETKEY=minioadmin
 # Optional
 NVINGEST_MINIO_BUCKET=nv-ingest
+
+# Optional: use your own OpenAI-compatible (vLLM) model for final generation
+# (retrieval still happens via NVIDIA RAG + Milvus)
+GENERATION_BACKEND=openai
+OPENAI_BASE_URL=http://<HOST>:<PORT>
+OPENAI_MODEL=openai/gpt-oss-120b
+OPENAI_API_KEY=dummy
 ```
 
 Notes:
@@ -66,6 +73,12 @@ Quick health check (worker):
 
 ```bash
 curl http://localhost:8123/health
+```
+
+Readiness check (validates OpenAI/vLLM settings when enabled):
+
+```bash
+curl http://localhost:8123/ready
 ```
 
 ## Connect Pipelines to Open WebUI
@@ -106,6 +119,14 @@ Collection naming conventions (prefix defaults to `owui`):
   - Data is stored in the `owui_pg` volume; remove with care if you need a reset
 - Milvus:
   - Verify it’s reachable at `VDB_ENDPOINT` and the collection prefix has permissions to create collections
+
+## Production checklist (high-signal)
+- **MinIO**: `MINIO_ENDPOINT` must be a Docker-reachable hostname (never `localhost` inside containers).
+- **Generation backend**:
+  - If using vLLM/OpenAI: set `GENERATION_BACKEND=openai`, plus `OPENAI_BASE_URL` + `OPENAI_MODEL`.
+  - Validate with `curl http://localhost:8123/ready` (should return `status: ok`).
+- **Networking**: ensure `NO_PROXY` includes your internal service names so proxy settings don’t break container-to-container traffic.
+- **Restarts**: after editing `docker/pipelines/nvidia_ingest_bridge_pipe.py`, restart the `pipelines` container to reload it.
 
 ## Direct worker calls (optional)
 You can test the worker directly.

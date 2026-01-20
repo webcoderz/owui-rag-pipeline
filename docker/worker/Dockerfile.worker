@@ -11,7 +11,7 @@ ENV PIP_OPTIONS="--proxy ${HTTP_PROXY} --trusted-host pypi.org --trusted-host fi
 WORKDIR /app
 
 # basic deps (python-multipart needed for UploadFile)
-RUN pip install $PIP_OPTIONS fastapi uvicorn[standard] python-multipart nvidia-rag[rag,ingest]
+RUN pip install $PIP_OPTIONS fastapi uvicorn[standard] python-multipart requests nvidia-rag[rag,ingest]
 
 COPY nvidia_rag_worker.py /app/nvidia_rag_worker.py
 
