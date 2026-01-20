@@ -27,7 +27,7 @@ def _now() -> int:
     return int(time.time())
 
 
-def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> dict:
+def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> str:
     delta: Dict[str, Any] = {}
     if role:
         delta["role"] = role
@@ -40,20 +40,17 @@ def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> dic
         "model": model or "nvidia-rag-auto-ingest",
         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
     }
-    return payload
+    # Yield JSON strings for streaming. The Pipelines runtime handles SSE framing.
+    # Yielding Python dicts may stringify with single-quotes (invalid JSON) which OWUI drops.
+    return json.dumps(payload)
 
 
-def _sse_done(model: str) -> dict:
-    return {
-        "id": f"chatcmpl-{uuid.uuid4().hex}",
-        "object": "chat.completion.chunk",
-        "created": _now(),
-        "model": model or "nvidia-rag-auto-ingest",
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    }
+def _sse_done(_: str) -> str:
+    # OpenAI streaming terminator
+    return "[DONE]"
 
 
-def _parse_worker_sse_line(model: str, line: str) -> Optional[dict]:
+def _parse_worker_sse_line(model: str, line: str) -> Optional[str]:
     """
     Worker streams OpenAI-style SSE lines. The Pipelines runtime usually handles SSE framing,
     so we convert lines to chunk dicts here.
@@ -67,13 +64,9 @@ def _parse_worker_sse_line(model: str, line: str) -> Optional[dict]:
         line = line[len("data:") :].strip()
     if not line or line == "[DONE]":
         return _sse_done(model)
-    try:
-        obj = json.loads(line)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    # Fallback: treat as plain text content
+    # If it looks like JSON already, return as-is (the runtime will frame it)
+    if line.startswith("{") and line.endswith("}"):
+        return line
     return _sse_chunk(model, content=line)
 
 
@@ -642,7 +635,7 @@ class Pipeline:
                 yield _sse_done(model_id)
                 return
 
-            status_q: asyncio.Queue[dict] = asyncio.Queue()
+            status_q: asyncio.Queue[str] = asyncio.Queue()
 
             async def emit(msg: str):
                 await status_q.put(_sse_chunk(model_id, msg))
