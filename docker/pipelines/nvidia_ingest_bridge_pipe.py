@@ -512,7 +512,7 @@ class Pipeline:
     # Main pipe
     # -----------------------
 
-    async def pipe(
+    def pipe(
         self,
         body: dict,
         __user__: Optional[dict] = None,
@@ -528,8 +528,69 @@ class Pipeline:
 
         chat_id = body.get("chat_id") or body.get("conversation_id") or body.get("id") or str(_now())
 
+        # Prefer runtime-provided `user_message` if present (newer Pipelines versions),
+        # otherwise fall back to the last user message in the chat payload.
+        messages = body.get("messages") or []
+        last_user_text = ""
+        if messages and (messages[-1].get("role") == "user"):
+            last_user_text = (messages[-1].get("content") or "")
+        text = ((user_message or last_user_text) or "").strip().lower()
+
         async def runner():
             yield _sse_chunk(model_id, role="assistant")
+
+            # Command handling (these won't show as UI autocomplete; we respond explicitly)
+            if text in ("/commands", "/help", "/?"):
+                yield _sse_chunk(
+                    model_id,
+                    "Commands:\n"
+                    "- `/library on` — save future ingests to your library\n"
+                    "- `/library off` — do not save future ingests to your library\n"
+                    "- `/library` — show this chat's current save-to-library setting\n"
+                    "- `/commands` — show this help\n",
+                )
+                yield "data: [DONE]\n\n"
+                return
+
+            if text == "/library":
+                try:
+                    current = await self._chat_get_save_to_library(user_key, chat_id)
+                    yield _sse_chunk(
+                        model_id,
+                        "📚 Library setting for this chat: "
+                        + (
+                            "ON (new ingests will be saved to your library)\n"
+                            if current
+                            else "OFF (new ingests will NOT be saved to your library)\n"
+                        ),
+                    )
+                except Exception as e:
+                    yield _sse_chunk(model_id, f"❌ Failed to read library setting: {e}\n")
+                yield "data: [DONE]\n\n"
+                return
+
+            if text in ("/library on", "/library true", "/library enable"):
+                try:
+                    await self._chat_set_save_to_library(user_key, chat_id, True)
+                    yield _sse_chunk(model_id, "✅ This chat will save new ingests to your library.\n")
+                except Exception as e:
+                    yield _sse_chunk(model_id, f"❌ Failed to set library ON: {e}\n")
+                yield "data: [DONE]\n\n"
+                return
+
+            if text in ("/library off", "/library false", "/library disable"):
+                try:
+                    await self._chat_set_save_to_library(user_key, chat_id, False)
+                    yield _sse_chunk(model_id, "✅ This chat will NOT save new ingests to your library.\n")
+                except Exception as e:
+                    yield _sse_chunk(model_id, f"❌ Failed to set library OFF: {e}\n")
+                yield "data: [DONE]\n\n"
+                return
+
+            if text.startswith("/"):
+                yield _sse_chunk(model_id, f"❓ Unknown command: `{text}`\nTry `/commands`.\n")
+                yield "data: [DONE]\n\n"
+                return
 
             if not self.valves.OPENWEBUI_API_KEY:
                 yield _sse_chunk(model_id, "❌ OPENWEBUI_API_KEY is not set. Cannot access OWUI files/knowledge.\n")
@@ -542,21 +603,6 @@ class Pipeline:
                 await status_q.put(_sse_chunk(model_id, msg))
 
             async with httpx.AsyncClient() as ow_client, httpx.AsyncClient() as worker_client:
-                # Chat command: /library on|off
-                messages = body.get("messages") or []
-                if messages and (messages[-1].get("role") == "user"):
-                    text = (messages[-1].get("content") or "").strip().lower()
-                    if text in ("/library on", "/library true", "/library enable"):
-                        await self._chat_set_save_to_library(user_key, chat_id, True)
-                        yield _sse_chunk(model_id, "✅ This chat will save new ingests to your library.\n")
-                        yield "data: [DONE]\n\n"
-                        return
-                    if text in ("/library off", "/library false", "/library disable"):
-                        await self._chat_set_save_to_library(user_key, chat_id, False)
-                        yield _sse_chunk(model_id, "✅ This chat will NOT save new ingests to your library.\n")
-                        yield "data: [DONE]\n\n"
-                        return
-
                 # Save-to-library decision:
                 # - explicit request field wins
                 # - else use per-chat setting

@@ -213,3 +213,4 @@ nv-rag.py
 .python-version
 __pycache__/
 .tmp/
+rag
