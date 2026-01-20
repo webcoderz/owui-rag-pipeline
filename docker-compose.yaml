@@ -53,6 +53,9 @@ services:
       MAX_PARALLEL_FILE_INGEST: "4"
     volumes:
       - ./docker/pipelines/nvidia_ingest_bridge_pipe.py:/app/pipelines/nvidia_ingest_bridge_pipe.py:ro
+      # Some Pipelines builds copy/import pipelines from a per-pipeline subfolder (created at startup).
+      # Mount into both locations so updates always apply.
+      - ./docker/pipelines/nvidia_ingest_bridge_pipe.py:/app/pipelines/nvidia_ingest_bridge_pipe/nvidia_ingest_bridge_pipe.py:ro
 
     depends_on:
       - owui-postgres
