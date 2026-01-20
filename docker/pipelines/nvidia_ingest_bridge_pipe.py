@@ -40,14 +40,11 @@ def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> str
         "model": model or "nvidia-rag-auto-ingest",
         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
     }
-    # Yield JSON strings for streaming. The Pipelines runtime handles SSE framing.
-    # Yielding Python dicts may stringify with single-quotes (invalid JSON) which OWUI drops.
-    return json.dumps(payload)
+    return f"data: {json.dumps(payload)}\n\n"
 
 
 def _sse_done(_: str) -> str:
-    # OpenAI streaming terminator
-    return "[DONE]"
+    return "data: [DONE]\n\n"
 
 
 def _parse_worker_sse_line(model: str, line: str) -> Optional[str]:
@@ -64,10 +61,13 @@ def _parse_worker_sse_line(model: str, line: str) -> Optional[str]:
         line = line[len("data:") :].strip()
     if not line or line == "[DONE]":
         return _sse_done(model)
-    # If it looks like JSON already, return as-is (the runtime will frame it)
+    # Ensure "data:" prefix
     if line.startswith("{") and line.endswith("}"):
-        return line
-    return _sse_chunk(model, content=line)
+        return "data: " + line + "\n\n"
+    if line.startswith("data:"):
+        # normalize trailing newlines
+        return line + ("\n\n" if not line.endswith("\n\n") else "")
+    return "data: " + line + "\n\n"
 
 
 def _json_completion(model: str, content: str) -> dict:
@@ -608,6 +608,8 @@ class Pipeline:
         if text in ("/commands", "/help", "/?"):
             if stream:
                 async def cmd_stream():
+                    if (os.getenv("PIPE_DEBUG", "").lower() in ("1", "true", "yes")):
+                        logger.warning("cmd_stream: start")
                     yield _sse_chunk(model_id, role="assistant")
                     yield _sse_chunk(model_id, commands_text)
                     yield _sse_done(model_id)
@@ -625,6 +627,8 @@ class Pipeline:
             return _json_completion(model_id, msg)
 
         async def runner():
+            if (os.getenv("PIPE_DEBUG", "").lower() in ("1", "true", "yes")):
+                logger.warning("runner: start")
             yield _sse_chunk(model_id, role="assistant")
 
             # Command handling (these won't show as UI autocomplete; we respond explicitly)
