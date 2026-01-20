@@ -512,7 +512,16 @@ class Pipeline:
     # Main pipe
     # -----------------------
 
-    async def pipe(self, body: dict, __user__: Optional[dict] = None):
+    async def pipe(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        # Open WebUI Pipelines may pass extra kwargs depending on version.
+        # Accept them to avoid runtime crashes like:
+        #   TypeError: Pipeline.pipe() got unexpected keyword argument 'user_message'
+        user_message: Optional[str] = None,
+        **kwargs,
+    ):
         user = __user__ or {}
         user_key = self._user_key(user)
         model_id = body.get("model") or "nvidia-rag-auto-ingest"
