@@ -2,7 +2,7 @@
 title: NVIDIA RAG (Worker • Postgres • Chat Allowlist • User Library • SSE)
 author: Cody Webb
 version: 1.2.0
-requirements: httpx, psycopg[binary], psycopg_pool
+requirements: httpx, asyncpg
 """
 
 import asyncio
@@ -14,11 +14,10 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+import asyncpg
 import httpx
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from psycopg.rows import dict_row
-from psycopg_pool import AsyncConnectionPool
 
 
 def _now() -> int:
@@ -87,7 +86,7 @@ class Pipeline:
 
     def __init__(self):
         self.valves = self.Valves()
-        self._pool: Optional[AsyncConnectionPool] = None
+        self._pool: Optional[asyncpg.Pool] = None
 
     def pipes(self):
         return [{"id": "nvidia-rag-auto-ingest", "name": "NVIDIA RAG (Auto-Ingest • Library • Persistent)"}]
@@ -96,19 +95,9 @@ class Pipeline:
     # DB init + helpers
     # -----------------------
 
-    async def _db(self) -> AsyncConnectionPool:
+    async def _db(self) -> asyncpg.Pool:
         if not self._pool:
-            # NOTE: We use psycopg (psycopg3) instead of asyncpg because the Open WebUI
-            # pipelines image may run a Python version where asyncpg wheels aren't available,
-            # causing "no matching distribution" at startup.
-            self._pool = AsyncConnectionPool(
-                conninfo=self.valves.DATABASE_URL,
-                min_size=1,
-                max_size=10,
-                kwargs={"row_factory": dict_row},
-                open=False,
-            )
-            await self._pool.open()
+            self._pool = await asyncpg.create_pool(self.valves.DATABASE_URL, min_size=1, max_size=10)
             await self._init_db()
         return self._pool
 
@@ -116,7 +105,7 @@ class Pipeline:
         pool = self._pool
         if not pool:
             return
-        async with pool.connection() as conn:
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ingest_manifest (
@@ -198,12 +187,11 @@ class Pipeline:
 
     async def _allowlist_get(self, user_key: str, chat_id: str) -> List[str]:
         pool = await self._db()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                "SELECT collection_name FROM chat_allowlist WHERE user_key=%s AND chat_id=%s",
-                (user_key, chat_id),
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT collection_name FROM chat_allowlist WHERE user_key=$1 AND chat_id=$2",
+                user_key, chat_id
             )
-            rows = await cur.fetchall()
         return [r["collection_name"] for r in rows]
 
     async def _allowlist_add(self, user_key: str, chat_id: str, collections: List[str]) -> None:
@@ -212,65 +200,59 @@ class Pipeline:
         pool = await self._db()
         now = _now()
         values = [(user_key, chat_id, c, now) for c in collections]
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.executemany(
+        async with pool.acquire() as conn:
+            await conn.executemany(
                 """
                 INSERT INTO chat_allowlist (user_key, chat_id, collection_name, added_at)
-                VALUES (%s, %s, %s, %s)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT DO NOTHING
                 """,
                 values
-                )
+            )
 
     async def _library_include_by_default(self, user_key: str) -> bool:
         pool = await self._db()
         now = _now()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                "SELECT enabled, include_by_default FROM user_library_settings WHERE user_key=%s",
-                (user_key,),
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT enabled, include_by_default FROM user_library_settings WHERE user_key=$1",
+                user_key
             )
-            row = await cur.fetchone()
             if row:
                 return bool(row["enabled"]) and bool(row["include_by_default"])
             await conn.execute(
                 """
                 INSERT INTO user_library_settings (user_key, enabled, include_by_default, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES ($1, $2, $3, $4, $4)
                 """,
-                (
-                    user_key,
-                    bool(self.valves.LIBRARY_ENABLED_DEFAULT),
-                    bool(self.valves.LIBRARY_INCLUDE_BY_DEFAULT),
-                    now,
-                    now,
-                ),
+                user_key,
+                bool(self.valves.LIBRARY_ENABLED_DEFAULT),
+                bool(self.valves.LIBRARY_INCLUDE_BY_DEFAULT),
+                now
             )
             return bool(self.valves.LIBRARY_ENABLED_DEFAULT) and bool(self.valves.LIBRARY_INCLUDE_BY_DEFAULT)
 
     async def _chat_get_save_to_library(self, user_key: str, chat_id: str) -> bool:
         pool = await self._db()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                "SELECT save_to_library FROM chat_settings WHERE user_key=%s AND chat_id=%s",
-                (user_key, chat_id),
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT save_to_library FROM chat_settings WHERE user_key=$1 AND chat_id=$2",
+                user_key, chat_id
             )
-            row = await cur.fetchone()
         return bool(row["save_to_library"]) if row else False
 
     async def _chat_set_save_to_library(self, user_key: str, chat_id: str, value: bool) -> None:
         pool = await self._db()
         now = _now()
-        async with pool.connection() as conn:
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO chat_settings (user_key, chat_id, save_to_library, updated_at)
-                VALUES (%s, %s, %s, %s)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (user_key, chat_id)
                 DO UPDATE SET save_to_library=EXCLUDED.save_to_library, updated_at=EXCLUDED.updated_at
                 """,
-                (user_key, chat_id, value, now),
+                user_key, chat_id, value, now
             )
 
     # -----------------------
@@ -279,38 +261,36 @@ class Pipeline:
 
     async def _manifest_get_status(self, file_id: str, collection: str, sha: str) -> Optional[str]:
         pool = await self._db()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                "SELECT status FROM ingest_manifest WHERE file_id=%s AND collection_name=%s AND sha256=%s",
-                (file_id, collection, sha),
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status FROM ingest_manifest WHERE file_id=$1 AND collection_name=$2 AND sha256=$3",
+                file_id, collection, sha
             )
-            row = await cur.fetchone()
         return row["status"] if row else None
 
     async def _manifest_try_claim(self, file_id: str, collection: str, sha: str) -> bool:
         pool = await self._db()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
+        async with pool.acquire() as conn:
+            res = await conn.execute(
                 """
                 INSERT INTO ingest_manifest (file_id, collection_name, sha256, status, updated_at)
-                VALUES (%s, %s, %s, 'pending', %s)
+                VALUES ($1, $2, $3, 'pending', $4)
                 ON CONFLICT (file_id, collection_name, sha256) DO NOTHING
                 """,
-                (file_id, collection, sha, _now()),
+                file_id, collection, sha, _now()
             )
-            # psycopg returns a cursor; `rowcount` is the number of inserted rows.
-            return bool(getattr(cur, "rowcount", 0))
+        return res.endswith("1")
 
     async def _manifest_set(self, file_id: str, collection: str, sha: str, status: str) -> None:
         pool = await self._db()
-        async with pool.connection() as conn:
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE ingest_manifest
-                SET status=%s, updated_at=%s
-                WHERE file_id=%s AND collection_name=%s AND sha256=%s
+                SET status=$4, updated_at=$5
+                WHERE file_id=$1 AND collection_name=$2 AND sha256=$3
                 """,
-                (status, _now(), file_id, collection, sha),
+                file_id, collection, sha, status, _now()
             )
 
     async def _wait_for_terminal(self, file_id: str, collection: str, sha: str) -> Optional[str]:
@@ -532,15 +512,7 @@ class Pipeline:
     # Main pipe
     # -----------------------
 
-    async def pipe(
-        self,
-        body: dict,
-        __user__: Optional[dict] = None,
-        # Open WebUI Pipelines may pass additional context as kwargs depending on version.
-        # We accept these explicitly (and **kwargs) to remain forward-compatible.
-        user_message: Optional[str] = None,
-        **kwargs,
-    ):
+    async def pipe(self, body: dict, __user__: Optional[dict] = None):
         user = __user__ or {}
         user_key = self._user_key(user)
         model_id = body.get("model") or "nvidia-rag-auto-ingest"
@@ -563,38 +535,8 @@ class Pipeline:
             async with httpx.AsyncClient() as ow_client, httpx.AsyncClient() as worker_client:
                 # Chat command: /library on|off
                 messages = body.get("messages") or []
-                last_user_text = ""
                 if messages and (messages[-1].get("role") == "user"):
-                    last_user_text = (messages[-1].get("content") or "")
-
-                # Prefer runtime-provided `user_message` if present (newer Pipelines versions),
-                # otherwise fall back to the last user message in the chat payload.
-                text = ((user_message or last_user_text) or "").strip().lower()
-                if text:
-                    # Help/commands
-                    if text in ("/commands", "/help", "/?"):
-                        yield _sse_chunk(
-                            model_id,
-                            "Commands:\n"
-                            "- `/library on` — save future ingests to your library\n"
-                            "- `/library off` — do not save future ingests to your library\n"
-                            "- `/library` — show this chat's current save-to-library setting\n"
-                            "- `/commands` — show this help\n",
-                        )
-                        yield "data: [DONE]\n\n"
-                        return
-
-                    # Show current setting
-                    if text == "/library":
-                        current = await self._chat_get_save_to_library(user_key, chat_id)
-                        yield _sse_chunk(
-                            model_id,
-                            "📚 Library setting for this chat: "
-                            + ("ON (new ingests will be saved to your library)\n" if current else "OFF (new ingests will NOT be saved to your library)\n"),
-                        )
-                        yield "data: [DONE]\n\n"
-                        return
-
+                    text = (messages[-1].get("content") or "").strip().lower()
                     if text in ("/library on", "/library true", "/library enable"):
                         await self._chat_set_save_to_library(user_key, chat_id, True)
                         yield _sse_chunk(model_id, "✅ This chat will save new ingests to your library.\n")
@@ -603,17 +545,6 @@ class Pipeline:
                     if text in ("/library off", "/library false", "/library disable"):
                         await self._chat_set_save_to_library(user_key, chat_id, False)
                         yield _sse_chunk(model_id, "✅ This chat will NOT save new ingests to your library.\n")
-                        yield "data: [DONE]\n\n"
-                        return
-
-                    # If a user types a slash command we don't recognize, respond explicitly so it's obvious
-                    # whether the Pipeline is running.
-                    if text.startswith("/"):
-                        yield _sse_chunk(
-                            model_id,
-                            f"❓ Unknown command: `{text}`\n"
-                            "Try `/commands`.\n",
-                        )
                         yield "data: [DONE]\n\n"
                         return
 
