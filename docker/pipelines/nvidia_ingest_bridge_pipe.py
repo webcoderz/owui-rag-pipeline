@@ -567,21 +567,35 @@ class Pipeline:
                 sorted(list(body.keys())),
             )
 
-        # IMPORTANT:
-        # Open WebUI may call with stream=true, but for short slash-commands it's more reliable
-        # to return a non-stream JSON completion directly (so the UI always renders something).
+        commands_text = (
+            "Commands:\n"
+            "- /library on — save future ingests to your library\n"
+            "- /library off — do not save future ingests to your library\n"
+            "- /library — show this chat's current save-to-library setting\n"
+            "- /commands — show this help\n"
+        )
+
+        # For slash-commands, match the response type to the request:
+        # - stream=true  -> return SSE generator (so OWUI renders it as streaming output)
+        # - stream=false -> return a normal JSON completion
         if text in ("/commands", "/help", "/?"):
-            return _json_completion(
-                model_id,
-                "Commands:\n"
-                "- /library on — save future ingests to your library\n"
-                "- /library off — do not save future ingests to your library\n"
-                "- /library — show this chat's current save-to-library setting\n"
-                "- /commands — show this help\n",
-            )
+            if stream:
+                async def cmd_stream():
+                    yield _sse_chunk(model_id, role="assistant")
+                    yield _sse_chunk(model_id, commands_text)
+                    yield "data: [DONE]\n\n"
+                return cmd_stream()
+            return _json_completion(model_id, commands_text)
 
         if text.startswith("/"):
-            return _json_completion(model_id, f"Unknown command: {text}. Try /commands.")
+            msg = f"Unknown command: {text}. Try /commands."
+            if stream:
+                async def unknown_stream():
+                    yield _sse_chunk(model_id, role="assistant")
+                    yield _sse_chunk(model_id, msg + "\n")
+                    yield "data: [DONE]\n\n"
+                return unknown_stream()
+            return _json_completion(model_id, msg)
 
         async def runner():
             yield _sse_chunk(model_id, role="assistant")
