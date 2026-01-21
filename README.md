@@ -1,5 +1,7 @@
 ## OWUI RAG Pipeline - Operations Guide
 
+[![CI](https://github.com/webcoderz/owui-rag-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/webcoderz/owui-rag-pipeline/actions/workflows/ci.yml)
+
 This repo wires Open WebUI Pipelines to an NVIDIA RAG worker (Python SDK) and a Postgres-backed ingest manifest, with Milvus as the VDB.
 
 ### What you get
