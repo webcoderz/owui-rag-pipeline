@@ -585,7 +585,7 @@ class Pipeline:
     # Main pipe
     # -----------------------
 
-    def pipe(
+    async def pipe(
         self,
         body: dict,
         __user__: Optional[dict] = None,
