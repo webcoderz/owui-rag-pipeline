@@ -1,5 +1,4 @@
 # OWUI RAG Pipeline
-
 [![CI](https://github.com/webcoderz/owui-rag-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/webcoderz/owui-rag-pipeline/actions/workflows/ci.yml)
 
 
