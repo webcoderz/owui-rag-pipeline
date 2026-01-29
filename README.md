@@ -130,6 +130,8 @@ In Open WebUI:
    - `/query <question>` — ask a question using the current chat’s remembered collections (and optionally your library if enabled by default)
    - `/query <collection> <question>` — ask a question using a specific collection only
    - `/query chat <question>` / `/query library <question>` — shorthand for derived collections
+   - `/delete <collection> <filename>` — delete a document from a collection (uses worker `DELETE /v1/documents`)
+   - `/delete chat <filename>` / `/delete library <filename>` — shorthand for derived collections
 
 Notes:
 - These are not Open WebUI “tool” slash commands, so they won’t autocomplete; they work only when you’re chatting with the pipeline model.

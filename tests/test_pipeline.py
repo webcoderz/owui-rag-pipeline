@@ -348,6 +348,31 @@ def test_pipe_query_explicit_collection(monkeypatch):
     assert "data: [DONE]" in text
 
 
+def test_pipe_delete_command(monkeypatch):
+    module = _load_pipeline_module()
+    p = module.Pipeline()
+    p.valves.OPENWEBUI_API_KEY = "token"
+    p.valves.VDB_ENDPOINT = "http://milvus:19530"
+
+    captured = {"collection": None, "names": None}
+
+    async def stub_call_worker_delete_documents(client, collection_name: str, document_names):
+        captured["collection"] = collection_name
+        captured["names"] = list(document_names)
+        return {"message": "deleted", "documents": [{"document_name": n, "metadata": {}} for n in document_names]}
+
+    monkeypatch.setattr(p, "_call_worker_delete_documents", stub_call_worker_delete_documents)
+
+    body = {"messages": [{"role": "user", "content": "/delete owui-explicit embedded_table.pdf"}], "stream": True, "chat_id": "c1"}
+    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "u"}))
+    text = anyio.run(lambda: _collect_streaming_text(resp))
+
+    assert captured["collection"] == "owui-explicit"
+    assert captured["names"] == ["embedded_table.pdf"]
+    assert "Delete request" in text
+    assert "data: [DONE]" in text
+
+
 def test_pipe_ingest_and_generate(monkeypatch, tmp_path):
     module = _load_pipeline_module()
     p = module.Pipeline()

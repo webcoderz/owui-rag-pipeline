@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import tempfile
@@ -6,7 +7,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import Body, FastAPI, File, Form, Query, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # ----
@@ -35,6 +36,73 @@ app = FastAPI(title="nvidia-rag-worker", version="1.0.0")
 
 rag = NvidiaRAG()
 ingestor = NvidiaRAGIngestor()
+
+
+def _filter_kwargs_for_callable(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Filter kwargs down to only what `fn` accepts.
+    This keeps us compatible across NVIDIA RAG SDK versions.
+    """
+    try:
+        sig = inspect.signature(fn)
+        allowed = set(sig.parameters.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
+    except Exception:
+        return kwargs
+
+
+async def _maybe_await(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _call_ingestor_first(method_names: List[str], **kwargs):
+    """
+    Try a list of method names on `ingestor`, returning the first successful call result.
+    Raises the last exception if all candidate methods fail.
+    """
+    last_exc: Optional[Exception] = None
+    for name in method_names:
+        fn = getattr(ingestor, name, None)
+        if not fn:
+            continue
+        try:
+            filtered = _filter_kwargs_for_callable(fn, kwargs)
+            return await _maybe_await(fn(**filtered))
+        except Exception as e:
+            last_exc = e
+            continue
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Delete/list documents is not supported by the installed nvidia_rag SDK.")
+
+
+def _safe_upload_filename(name: Optional[str]) -> str:
+    """
+    Sanitize an upload filename for use as a temp filepath.
+    We keep the original basename so document deletion by name is possible later.
+    """
+    raw = (name or "").strip()
+    raw = raw.replace("\\", "/")
+    base = os.path.basename(raw) if raw else ""
+    base = base.strip() or "upload"
+
+    # Allow only a conservative set of characters.
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_. ")
+    cleaned = "".join(ch if ch in allowed else "_" for ch in base)
+    cleaned = " ".join(cleaned.split()).strip()  # normalize whitespace
+    cleaned = cleaned.replace(" ", "_")
+    if not cleaned:
+        cleaned = "upload"
+
+    # Keep filename bounded (avoid Windows/path issues).
+    if len(cleaned) > 180:
+        root, ext = os.path.splitext(cleaned)
+        cleaned = root[:160] + ext[:20]
+
+    return cleaned
+
 
 def _get_last_user_text(messages: List[Dict[str, Any]]) -> str:
     for m in reversed(messages or []):
@@ -197,14 +265,14 @@ async def ingest(
         pass
 
     # write to temp file because upload_documents expects filepaths
-    suffix = ""
-    if file.filename and "." in file.filename:
-        suffix = "." + file.filename.split(".")[-1]
-
     tmp_path = None
+    tmp_dir = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp_path = tmp.name
+        # Create a per-request directory and write the file using the *original* filename
+        # (sanitized). This allows later delete-by-document-name to work consistently.
+        tmp_dir = tempfile.mkdtemp(prefix="owui_upload_")
+        tmp_path = os.path.join(tmp_dir, _safe_upload_filename(file.filename))
+        with open(tmp_path, "wb") as tmp:
             content = await file.read()
             tmp.write(content)
 
@@ -224,6 +292,86 @@ async def ingest(
                 os.remove(tmp_path)
             except Exception:
                 pass
+        if tmp_dir:
+            try:
+                os.rmdir(tmp_dir)
+            except Exception:
+                pass
+
+
+@app.get("/v1/documents")
+async def list_documents(
+    collection_name: str = Query(default="multimodal_data"),
+    vdb_endpoint: Optional[str] = Query(default=None),
+):
+    """
+    Compatibility endpoint mirroring the NVIDIA RAG Ingestor Server:
+      GET /v1/documents?collection_name=...
+
+    Returns a list of documents known to the ingestion layer for that collection.
+    """
+    try:
+        vdb = vdb_endpoint or (os.getenv("VDB_ENDPOINT") or "http://milvus:19530")
+        # Support multiple possible SDK method names.
+        resp = await _call_ingestor_first(
+            ["get_documents", "list_documents"],
+            collection_name=collection_name,
+            vdb_endpoint=vdb,
+        )
+        return JSONResponse(resp if isinstance(resp, dict) else {"result": resp})
+    except Exception as e:
+        return JSONResponse(
+            {
+                "error": "list_documents_not_supported",
+                "detail": str(e),
+                "hint": "This repo runs a lightweight worker. The full NVIDIA Ingestor Server exposes GET/DELETE /v1/documents.",
+            },
+            status_code=501,
+        )
+
+
+@app.delete("/v1/documents")
+async def delete_documents(
+    collection_name: str = Query(default="multimodal_data"),
+    vdb_endpoint: Optional[str] = Query(default=None),
+    file_names: Optional[List[str]] = Body(default=None),
+):
+    """
+    Compatibility endpoint mirroring the NVIDIA RAG Ingestor Server:
+      DELETE /v1/documents?collection_name=...
+      body: ["file1.pdf", "file2.pdf"]
+
+    Deletes documents (by document name / filename) from the specified collection.
+    """
+    try:
+        if file_names is not None and not isinstance(file_names, list):
+            return JSONResponse({"error": "invalid_body", "detail": "Expected JSON array of strings."}, status_code=422)
+
+        vdb = vdb_endpoint or (os.getenv("VDB_ENDPOINT") or "http://milvus:19530")
+
+        # Provide multiple possible parameter names (filtered by signature).
+        kwargs: Dict[str, Any] = {
+            "collection_name": collection_name,
+            "vdb_endpoint": vdb,
+            "file_names": file_names,
+            "document_names": file_names,
+            "documents": file_names,
+        }
+
+        resp = await _call_ingestor_first(
+            ["delete_documents", "delete_document", "remove_documents", "remove_document"],
+            **kwargs,
+        )
+        return JSONResponse(resp if isinstance(resp, dict) else {"result": resp})
+    except Exception as e:
+        return JSONResponse(
+            {
+                "error": "delete_documents_not_supported",
+                "detail": str(e),
+                "hint": "If you deployed the NVIDIA Ingestor Server, it supports DELETE /v1/documents as shown in their notebooks.",
+            },
+            status_code=501,
+        )
 
 
 @app.post("/generate")

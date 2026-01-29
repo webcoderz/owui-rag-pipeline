@@ -539,6 +539,27 @@ class Pipeline:
                 if line:
                     yield line
 
+    async def _call_worker_delete_documents(
+        self,
+        client: httpx.AsyncClient,
+        collection_name: str,
+        document_names: List[str],
+    ) -> dict:
+        """
+        Delete documents from a collection via the worker's compatibility endpoint:
+          DELETE /v1/documents?collection_name=...&vdb_endpoint=...
+          body: ["doc1.pdf", "doc2.pdf"]
+        """
+        r = await client.request(
+            "DELETE",
+            f"{self.valves.NVIDIA_WORKER_URL}/v1/documents",
+            params={"collection_name": collection_name, "vdb_endpoint": self.valves.VDB_ENDPOINT},
+            json=document_names,
+            timeout=self.valves.OWUI_JSON_TIMEOUT_S,
+        )
+        r.raise_for_status()
+        return r.json()
+
     # -----------------------
     # Ingest orchestration
     # -----------------------
@@ -698,6 +719,7 @@ class Pipeline:
             "- /library — show this chat's current save-to-library setting\n"
             "- /ingest [collection] — ingest attachments/KBs and stop (optional target collection)\n"
             "- /query [collection] <question> — query remembered collections, or a specific collection\n"
+            "- /delete <collection> <filename> — delete a document from a collection\n"
             "- /commands — show this help\n"
         )
 
@@ -963,6 +985,76 @@ class Pipeline:
                 return _sync_stream_from_async(query_stream())
             return _json_completion(model_id, "Use stream=true for /query.")
 
+        # /delete: delete a document from a collection (worker-backed)
+        if text.startswith("/delete"):
+            raw_after = raw_text[len("/delete") :].strip()
+            parts = raw_after.split(None, 1) if raw_after else []
+            if len(parts) < 2:
+                msg = "Usage: /delete <collection> <filename>\nExample: /delete owui-u-me-library embedded_table.pdf\n"
+                if stream:
+                    async def del_usage_stream():
+                        yield _sse_chunk(model_id, role="assistant")
+                        yield _sse_chunk(model_id, msg)
+                        yield _sse_done(model_id)
+                    return _sync_stream_from_async(del_usage_stream())
+                return _json_completion(model_id, msg)
+
+            collection_token = parts[0].strip()
+            filename = parts[1].strip()
+            # strip simple surrounding quotes
+            if (filename.startswith('"') and filename.endswith('"')) or (filename.startswith("'") and filename.endswith("'")):
+                filename = filename[1:-1].strip()
+
+            if collection_token.lower() == "chat":
+                collection_name = self._chat_collection_name(chat_id, user)
+            elif collection_token.lower() == "library":
+                collection_name = self._library_collection_name(user_key)
+            else:
+                collection_name = self._sanitize_collection_name(collection_token)
+
+            if not collection_name:
+                msg = "❌ Invalid collection name. Allowed: letters, digits, '-', '_', '.', ':'\n"
+                if stream:
+                    async def del_bad_coll_stream():
+                        yield _sse_chunk(model_id, role="assistant")
+                        yield _sse_chunk(model_id, msg)
+                        yield _sse_done(model_id)
+                    return _sync_stream_from_async(del_bad_coll_stream())
+                return _json_completion(model_id, msg)
+
+            if not filename:
+                msg = "❌ Missing filename.\nUsage: /delete <collection> <filename>\n"
+                if stream:
+                    async def del_bad_file_stream():
+                        yield _sse_chunk(model_id, role="assistant")
+                        yield _sse_chunk(model_id, msg)
+                        yield _sse_done(model_id)
+                    return _sync_stream_from_async(del_bad_file_stream())
+                return _json_completion(model_id, msg)
+
+            async def delete_stream():
+                yield _sse_chunk(model_id, role="assistant")
+                try:
+                    async with httpx.AsyncClient() as worker_client:
+                        resp = await self._call_worker_delete_documents(worker_client, collection_name, [filename])
+                    yield _sse_chunk(model_id, f"🗑️ Delete request: `{filename}` from `{collection_name}`\n")
+                    # Print a compact success message if available
+                    if isinstance(resp, dict):
+                        deleted = resp.get("documents") or []
+                        if deleted:
+                            yield _sse_chunk(model_id, f"✅ Deleted: {len(deleted)} document(s)\n")
+                        else:
+                            yield _sse_chunk(model_id, "✅ Delete request completed.\n")
+                    else:
+                        yield _sse_chunk(model_id, "✅ Delete request completed.\n")
+                except Exception as e:
+                    yield _sse_chunk(model_id, f"❌ Delete failed: {e}\n")
+                yield _sse_done(model_id)
+
+            if stream:
+                return _sync_stream_from_async(delete_stream())
+            return _json_completion(model_id, "Use stream=true for /delete.")
+
         if text.startswith("/"):
             msg = f"Unknown command: {text}. Try /commands."
             if stream:
@@ -1117,6 +1209,7 @@ class Pipeline:
                     "- /library — show this chat's current save-to-library setting\n"
                     "- /ingest [collection] — ingest attachments/KBs and stop (optional target collection)\n"
                     "- /query [collection] <question> — query remembered collections, or a specific collection\n"
+                    "- /delete <collection> <filename> — delete a document from a collection\n"
                     "- /commands — show this help\n",
                 )
             if text.startswith("/"):
