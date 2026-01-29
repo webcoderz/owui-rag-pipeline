@@ -165,6 +165,36 @@ class Pipeline:
         return [{"id": "nvidia-rag-auto-ingest", "name": "NVIDIA RAG (Auto-Ingest • Library • Persistent)"}]
 
     # -----------------------
+    # Command parsing/helpers
+    # -----------------------
+
+    def _sanitize_collection_name(self, name: str) -> str:
+        """
+        Best-effort collection name sanitizer.
+        Allows: letters, digits, '-', '_', '.', ':'.
+        Also replaces whitespace with '-'.
+        """
+        s = (name or "").strip()
+        if not s:
+            return ""
+        s = "-".join(s.split())
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:")
+        s = "".join(ch for ch in s if ch in allowed)
+        return s
+
+    def _looks_like_collection_token(self, token: str) -> bool:
+        """
+        Heuristic to avoid interpreting natural-language questions as `/query <collection> <question>`.
+        We consider it a collection token if it contains typical collection punctuation or uses our prefix.
+        """
+        t = (token or "").strip()
+        if not t:
+            return False
+        if t.startswith(f"{self.valves.COLLECTION_PREFIX}-"):
+            return True
+        return any(ch in t for ch in "-_:.")
+
+    # -----------------------
     # DB init + helpers
     # -----------------------
 
@@ -607,7 +637,8 @@ class Pipeline:
         last_user_text = ""
         if messages and (messages[-1].get("role") == "user"):
             last_user_text = (messages[-1].get("content") or "")
-        text = ((user_message or last_user_text) or "").strip().lower()
+        raw_text = ((user_message or last_user_text) or "").strip()
+        text = raw_text.lower()
         stream = bool(body.get("stream", True))
 
         # Minimal debug to confirm OWUI payload shape without logging secrets/content.
@@ -661,9 +692,12 @@ class Pipeline:
 
         commands_text = (
             "Commands:\n"
+            "- /collection list — show this chat’s known/remembered collections\n"
             "- /library on — save future ingests to your library\n"
             "- /library off — do not save future ingests to your library\n"
             "- /library — show this chat's current save-to-library setting\n"
+            "- /ingest [collection] — ingest attachments/KBs and stop (optional target collection)\n"
+            "- /query [collection] <question> — query remembered collections, or a specific collection\n"
             "- /commands — show this help\n"
         )
 
@@ -680,6 +714,44 @@ class Pipeline:
                     yield _sse_done(model_id)
                 return _sync_stream_from_async(cmd_stream())
             return _json_completion(model_id, commands_text)
+
+        # /collection list: show known collections for this chat/user
+        if text in ("/collection list", "/collections", "/collections list"):
+            async def collections_stream():
+                yield _sse_chunk(model_id, role="assistant")
+                try:
+                    remembered = await self._allowlist_get(user_key, chat_id)
+                    remembered = list(dict.fromkeys(remembered))
+                    lib_collection = self._library_collection_name(user_key)
+                    include_lib = await self._library_include_by_default(user_key)
+                    save_to_library = await self._chat_get_save_to_library(user_key, chat_id)
+                    chat_collection = self._chat_collection_name(chat_id, user)
+
+                    lines: List[str] = []
+                    lines.append("Collections:\n")
+                    lines.append(f"- Chat uploads (derived): `{chat_collection}`\n")
+                    lines.append(f"- Your library (derived): `{lib_collection}`\n")
+                    lines.append(f"- Library included by default: {'ON' if include_lib else 'OFF'}\n")
+                    lines.append(f"- Save-to-library for this chat: {'ON' if save_to_library else 'OFF'}\n")
+
+                    if remembered:
+                        lines.append("\nRemembered (chat allowlist):\n")
+                        for c in remembered:
+                            lines.append(f"- `{c}`\n")
+                    else:
+                        lines.append("\nRemembered (chat allowlist): (none yet)\n")
+
+                    lines.append("\nTips:\n")
+                    lines.append("- Use `/ingest <collection>` to ingest into a specific collection.\n")
+                    lines.append("- Use `/query <collection> <question>` to query a specific collection.\n")
+                    yield _sse_chunk(model_id, "".join(lines))
+                except Exception as e:
+                    yield _sse_chunk(model_id, f"❌ Collection list failed: {e}\n")
+                yield _sse_done(model_id)
+
+            if stream:
+                return _sync_stream_from_async(collections_stream())
+            return _json_completion(model_id, "Use stream=true for /collection list.")
 
         # /library helpers (per-chat toggle)
         if text in ("/library", "/library on", "/library off", "/library true", "/library false", "/library enable", "/library disable"):
@@ -715,7 +787,16 @@ class Pipeline:
             return _json_completion(model_id, "This command is supported in streaming mode. Please retry with stream=true.")
 
         # /ingest: ingest current attachments/KBs and stop (no generation)
-        if text == "/ingest":
+        if text.startswith("/ingest"):
+            raw_after = raw_text[len("/ingest") :].strip()
+            # Allow a couple of friendly shorthands
+            if raw_after.lower() == "chat":
+                target_collection = self._chat_collection_name(chat_id, user)
+            elif raw_after.lower() == "library":
+                target_collection = self._library_collection_name(user_key)
+            else:
+                target_collection = self._sanitize_collection_name(raw_after) if raw_after else ""
+
             async def ingest_only_stream():
                 yield _sse_chunk(model_id, role="assistant")
 
@@ -730,6 +811,11 @@ class Pipeline:
                     yield _sse_done(model_id)
                     return
 
+                if raw_after and not target_collection:
+                    yield _sse_chunk(model_id, "❌ Invalid collection name. Allowed: letters, digits, '-', '_', '.', ':'\n")
+                    yield _sse_done(model_id)
+                    return
+
                 status_q: asyncio.Queue[str] = asyncio.Queue()
 
                 async def emit(msg: str):
@@ -738,11 +824,12 @@ class Pipeline:
                 async def do_ingest():
                     async with httpx.AsyncClient() as ow_client, httpx.AsyncClient() as worker_client:
                         adhoc_file_ids, kb_ids = self._split_refs(files)
+                        newly_used: List[str] = []
 
                         # KB files
                         for kb_id in kb_ids:
                             kb_meta = await self._ow_get_json(ow_client, f"/api/v1/knowledge/{kb_id}")
-                            kb_collection = self._kb_collection_name(kb_id, kb_meta)
+                            kb_collection = target_collection or self._kb_collection_name(kb_id, kb_meta)
                             await emit(f"📚 Knowledge `{kb_id}` → `{kb_collection}`\n")
 
                             kb_files = kb_meta.get("files") or []
@@ -758,10 +845,11 @@ class Pipeline:
                             await self._ingest_entries_into_collection(
                                 ow_client, worker_client, entries, kb_collection, emit, model_id
                             )
+                            newly_used.append(kb_collection)
 
                         # Ad-hoc files
                         if adhoc_file_ids:
-                            chat_collection = self._chat_collection_name(chat_id, user)
+                            chat_collection = target_collection or self._chat_collection_name(chat_id, user)
                             await emit(f"📥 Chat uploads → `{chat_collection}`\n")
                             entries2: List[Tuple[str, str]] = []
                             for fid in adhoc_file_ids:
@@ -772,6 +860,11 @@ class Pipeline:
                             await self._ingest_entries_into_collection(
                                 ow_client, worker_client, entries2, chat_collection, emit, model_id
                             )
+                            newly_used.append(chat_collection)
+
+                        # Persist chat remember-set for what we just ingested (helps /query defaults)
+                        if newly_used:
+                            await self._allowlist_add(user_key, chat_id, list(dict.fromkeys(newly_used)))
 
                 task = asyncio.create_task(do_ingest())
                 try:
@@ -803,10 +896,33 @@ class Pipeline:
         # /query: run a question against specific collections without ingesting
         if text.startswith("/query"):
             # preserve original casing/content for the query
-            raw = (user_message or last_user_text or "").strip()
-            query = raw[len("/query") :].strip()
-            if not query:
+            raw_after = raw_text[len("/query") :].strip()
+            if not raw_after:
                 return _json_completion(model_id, "Usage: /query <question>")
+
+            # Optional explicit collection: /query <collection> <question>
+            explicit_collection: str = ""
+            query = raw_after
+            parts = raw_after.split(None, 1)
+            if len(parts) == 2:
+                token = parts[0].strip()
+                rest = parts[1].strip()
+                if rest and (token.lower() in ("chat", "library") or self._looks_like_collection_token(token)):
+                    if token.lower() == "chat":
+                        explicit_collection = self._chat_collection_name(chat_id, user)
+                        query = rest
+                    elif token.lower() == "library":
+                        explicit_collection = self._library_collection_name(user_key)
+                        query = rest
+                    else:
+                        sanitized = self._sanitize_collection_name(token)
+                        if not sanitized:
+                            return _json_completion(
+                                model_id,
+                                "Invalid collection name. Allowed: letters, digits, '-', '_', '.', ':'.",
+                            )
+                        explicit_collection = sanitized
+                        query = rest
 
             async def query_stream():
                 yield _sse_chunk(model_id, role="assistant")
@@ -816,13 +932,18 @@ class Pipeline:
                     yield _sse_done(model_id)
                     return
 
-                # Determine collections: use remembered allowlist + (optional) library include by default.
-                remembered = await self._allowlist_get(user_key, chat_id)
-                collection_names: List[str] = list(dict.fromkeys(remembered))
-                lib_collection = self._library_collection_name(user_key)
-                if await self._library_include_by_default(user_key):
-                    collection_names.append(lib_collection)
-                    collection_names = list(dict.fromkeys(collection_names))
+                # Determine collections:
+                # - If explicit collection provided: only query that collection.
+                # - Else: use remembered allowlist + (optional) library include by default.
+                if explicit_collection:
+                    collection_names: List[str] = [explicit_collection]
+                else:
+                    remembered = await self._allowlist_get(user_key, chat_id)
+                    collection_names = list(dict.fromkeys(remembered))
+                    lib_collection = self._library_collection_name(user_key)
+                    if await self._library_include_by_default(user_key):
+                        collection_names.append(lib_collection)
+                        collection_names = list(dict.fromkeys(collection_names))
 
                 # Build messages: replace last user message content with the query
                 q_messages = list(messages)
@@ -990,9 +1111,12 @@ class Pipeline:
                 return _json_completion(
                     model_id,
                     "Commands:\n"
+                    "- /collection list — show this chat’s known/remembered collections\n"
                     "- /library on — save future ingests to your library\n"
                     "- /library off — do not save future ingests to your library\n"
                     "- /library — show this chat's current save-to-library setting\n"
+                    "- /ingest [collection] — ingest attachments/KBs and stop (optional target collection)\n"
+                    "- /query [collection] <question> — query remembered collections, or a specific collection\n"
                     "- /commands — show this help\n",
                 )
             if text.startswith("/"):

@@ -117,9 +117,23 @@ In Open WebUI:
    - Fetch the content from Open WebUI
    - Ingest into collections (named by convention)
    - Stream model responses via the NVIDIA worker
-3. Commands supported:
-   - `/library on` — future ingests save to your per-user library automatically
+3. Slash commands (handled by the pipeline):
+   - `/commands` or `/help` — show available commands
+   - `/collection list` — show this chat’s remembered collections + derived chat/library collection names
+   - `/library` — show this chat’s current “save to library” setting
+   - `/library on` — future ingests in this chat also save to your per-user library
    - `/library off` — disable auto-saving to your library for this chat
+   - `/ingest` — ingest the currently attached files / selected Knowledge Bases and stop (no response generation)
+   - `/ingest <collection>` — same, but ingest into a specific target collection (also remembers it for this chat)
+   - `/ingest chat` — shorthand for ingesting into this chat’s derived uploads collection
+   - `/ingest library` — shorthand for ingesting into your derived library collection
+   - `/query <question>` — ask a question using the current chat’s remembered collections (and optionally your library if enabled by default)
+   - `/query <collection> <question>` — ask a question using a specific collection only
+   - `/query chat <question>` / `/query library <question>` — shorthand for derived collections
+
+Notes:
+- These are not Open WebUI “tool” slash commands, so they won’t autocomplete; they work only when you’re chatting with the pipeline model.
+- For a UI-native tools experience, use the OpenAPI tools server (`owui-rag-tools`) above.
 
 Collection naming conventions (prefix defaults to `owui`):
 - Knowledge base: `owui-kb-<kb_id>` or `owui-kb-public-<kb_id>`

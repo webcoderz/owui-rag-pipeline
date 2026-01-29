@@ -244,6 +244,110 @@ def test_pipe_library_toggle(monkeypatch):
     assert "library setting" in text_st.lower()
 
 
+def test_pipe_collection_list(monkeypatch):
+    module = _load_pipeline_module()
+    p = module.Pipeline()
+    p.valves.OPENWEBUI_API_KEY = "token"
+
+    async def stub_allowlist_get(user_key: str, chat_id: str):
+        return ["owui-a", "owui-b", "owui-b"]
+
+    async def stub_library_include_by_default(user_key: str):
+        return True
+
+    async def stub_chat_get_save_to_library(user_key: str, chat_id: str):
+        return False
+
+    monkeypatch.setattr(p, "_allowlist_get", stub_allowlist_get)
+    monkeypatch.setattr(p, "_library_include_by_default", stub_library_include_by_default)
+    monkeypatch.setattr(p, "_chat_get_save_to_library", stub_chat_get_save_to_library)
+
+    body = {"messages": [{"role": "user", "content": "/collection list"}], "stream": True, "chat_id": "c1"}
+    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "u"}))
+    text = anyio.run(lambda: _collect_streaming_text(resp))
+    assert "Collections:" in text
+    assert "owui-a" in text
+    assert "owui-b" in text
+    assert "data: [DONE]" in text
+
+
+def test_pipe_ingest_target_collection(monkeypatch):
+    module = _load_pipeline_module()
+    p = module.Pipeline()
+    p.valves.OPENWEBUI_API_KEY = "token"
+
+    seen = {"collections": [], "allowlist_added": []}
+
+    async def stub_ow_get_json(client, path: str):
+        if path.startswith("/api/v1/knowledge/"):
+            return {"files": [{"id": "fid1", "filename": "doc.txt"}]}
+        if path.startswith("/api/v1/files/"):
+            return {"filename": "upload.txt", "size": 10}
+        return {}
+
+    async def stub_ingest_entries_into_collection(ow_client, worker_client, entries, collection_name, emit, model_id: str):
+        seen["collections"].append(collection_name)
+        await emit(f"(stub ingest to {collection_name})\n")
+
+    async def stub_allowlist_add(user_key: str, chat_id: str, collections):
+        seen["allowlist_added"].append(list(collections))
+
+    monkeypatch.setattr(p, "_ow_get_json", stub_ow_get_json)
+    monkeypatch.setattr(p, "_ingest_entries_into_collection", stub_ingest_entries_into_collection)
+    monkeypatch.setattr(p, "_allowlist_add", stub_allowlist_add)
+
+    body = {
+        "messages": [{"role": "user", "content": "/ingest owui-custom"}],
+        "stream": True,
+        "chat_id": "chat-1",
+        "files": [
+            {"type": "collection", "id": "kb1"},
+            {"type": "file", "id": "file-123"},
+        ],
+    }
+    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "u"}))
+    text = anyio.run(lambda: _collect_streaming_text(resp))
+
+    assert "`owui-custom`" in text
+    assert set(seen["collections"]) == {"owui-custom"}
+    assert seen["allowlist_added"]  # should remember what it ingested
+    assert "data: [DONE]" in text
+
+
+def test_pipe_query_explicit_collection(monkeypatch):
+    module = _load_pipeline_module()
+    p = module.Pipeline()
+    p.valves.OPENWEBUI_API_KEY = "token"
+
+    captured = {"collections": None, "query": None}
+
+    async def stub_stream_worker_generate(client, messages, collection_names):
+        captured["collections"] = list(collection_names)
+        # last message should have the query
+        captured["query"] = (messages[-1] or {}).get("content")
+        yield 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        yield "data: [DONE]\n\n"
+
+    # Ensure allowlist/library defaults would be ignored if explicit collection is provided
+    async def stub_allowlist_get(user_key: str, chat_id: str):
+        return ["owui-should-not-be-used"]
+
+    async def stub_library_include_by_default(user_key: str):
+        return True
+
+    monkeypatch.setattr(p, "_stream_worker_generate", stub_stream_worker_generate)
+    monkeypatch.setattr(p, "_allowlist_get", stub_allowlist_get)
+    monkeypatch.setattr(p, "_library_include_by_default", stub_library_include_by_default)
+
+    body = {"messages": [{"role": "user", "content": "/query owui-explicit what is up?"}], "stream": True, "chat_id": "c1"}
+    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "u"}))
+    text = anyio.run(lambda: _collect_streaming_text(resp))
+
+    assert captured["collections"] == ["owui-explicit"]
+    assert captured["query"] == "what is up?"
+    assert "data: [DONE]" in text
+
+
 def test_pipe_ingest_and_generate(monkeypatch, tmp_path):
     module = _load_pipeline_module()
     p = module.Pipeline()
