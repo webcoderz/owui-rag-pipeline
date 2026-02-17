@@ -80,7 +80,7 @@ services:
   caddy:
     image: caddy:2-alpine
     ports:
-      - "${CADDY_HTTP_PORT:-2080}:80"
+      - "${CADDY_HTTP_PORT:-80}:80"
     volumes:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
     networks:
