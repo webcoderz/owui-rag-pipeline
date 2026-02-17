@@ -1,16 +1,12 @@
-# Caddy reverse proxy for NVIDIA RAG stack: ingestor at 8082, RAG service at 8081.
-# Subpaths so you can hit both on one port. Adjust hostnames if your stack uses different service names.
+# Caddy: NVIDIA RAG subpaths + Open WebUI as default.
+# /ingestor -> 8082, /rag -> 8081; everything else -> Open WebUI (8080).
+# Avoids interference when Open WebUI and this proxy share the same box.
 
 {
   admin off
 }
 
 :80 {
-  # Root: simple info
-  handle / {
-    respond "NVIDIA RAG services proxy" 200
-  }
-
   # Ingestor service: /ingestor/* -> ingestor-server:8082
   handle_path /ingestor/* {
     reverse_proxy ingestor-server:8082
@@ -25,5 +21,10 @@
   }
   handle /rag {
     redir /rag/ permanent
+  }
+
+  # Everything else -> Open WebUI (must be last)
+  handle {
+    reverse_proxy open-webui:8080
   }
 }

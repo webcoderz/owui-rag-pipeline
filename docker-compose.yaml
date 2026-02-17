@@ -83,8 +83,8 @@ services:
       - "${CADDY_HTTP_PORT:-2080}:80"
     volumes:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-    # No depends_on: backends (nv-ingest, minio, milvus) are external NVIDIA RAG stack
     networks:
+      - open-webui_default
       - nvidia-rag
 
   owui-postgres:
