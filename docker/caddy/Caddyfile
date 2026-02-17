@@ -1,0 +1,29 @@
+# Caddy reverse proxy for NVIDIA RAG stack: ingestor at 8082, RAG service at 8081.
+# Subpaths so you can hit both on one port. Adjust hostnames if your stack uses different service names.
+
+{
+  admin off
+}
+
+:80 {
+  # Root: simple info
+  handle / {
+    respond "NVIDIA RAG services proxy" 200
+  }
+
+  # Ingestor service: /ingestor/* -> ingestor-server:8082
+  handle_path /ingestor/* {
+    reverse_proxy ingestor-server:8082
+  }
+  handle /ingestor {
+    redir /ingestor/ permanent
+  }
+
+  # RAG service: /rag/* -> rag-server:8081
+  handle_path /rag/* {
+    reverse_proxy rag-server:8081
+  }
+  handle /rag {
+    redir /rag/ permanent
+  }
+}
