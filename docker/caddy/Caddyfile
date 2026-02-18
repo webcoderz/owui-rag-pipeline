@@ -9,17 +9,7 @@
 :80 {
   # Ingestor service: /ingestor/* -> ingestor-server:8082
   handle_path /ingestor/* {
-    replace {
-      match header Content-Type text/html*
-      "/openapi.json" "/ingestor/openapi.json"
-    }
-    replace {
-      match header Content-Type application/json*
-      "\"url\": \"/\"" "\"url\": \"/ingestor\""
-    }
-    reverse_proxy ingestor-server:8082 {
-      header_up Accept-Encoding identity
-    }
+    reverse_proxy ingestor-server:8082
   }
   handle /ingestor {
     redir /ingestor/ permanent
@@ -27,17 +17,7 @@
 
   # RAG service: /rag/* -> rag-server:8081
   handle_path /rag/* {
-    replace {
-      match header Content-Type text/html*
-      "/openapi.json" "/rag/openapi.json"
-    }
-    replace {
-      match header Content-Type application/json*
-      "\"url\": \"/\"" "\"url\": \"/rag\""
-    }
-    reverse_proxy rag-server:8081 {
-      header_up Accept-Encoding identity
-    }
+    reverse_proxy rag-server:8081 
   }
   handle /rag {
     redir /rag/ permanent

@@ -72,9 +72,8 @@ What starts:
 - `nvidia-rag-worker` at `http://nvidia-rag-worker:8123` (exposed on host `8123`)
 - `pipelines` (Open WebUI Pipelines) with the custom pipe mounted
 - `owui-postgres` (stores ingest manifest and per-user settings)
-- `caddy` (optional reverse proxy) at host port `CADDY_HTTP_PORT` (default `2080`), proxying **NVIDIA RAG stack** at subpaths:
-  - `http://localhost:2080/ingestor/` → ingestor service on **8082** (e.g. `ingestor-server:8082`)
-  - `http://localhost:2080/rag/` → RAG service on **8081** (e.g. `rag-server:8081`). Backends must be on the same Docker network (e.g. `nvidia-rag`).
+- `proxy` (nginx) at host port `PROXY_HTTP_PORT` (default `80`), proxying **NVIDIA RAG stack** at subpaths and Open WebUI as default:
+  - `http://localhost/ingestor/` → ingestor (8082); `http://localhost/rag/` → RAG (8081); `/` → Open WebUI (8080). Swagger at `/rag/docs` and `/ingestor/docs` work via sub_filter. Backends on same Docker network (e.g. `nvidia-rag`, `open-webui_default`).
 
 Quick health check (worker):
 
@@ -164,13 +163,17 @@ Collection naming conventions (prefix defaults to `owui`):
 - **Networking**: ensure `NO_PROXY` includes your internal service names so proxy settings don’t break container-to-container traffic.
 - **Restarts**: after editing `docker/pipelines/nvidia_ingest_bridge_pipe.py`, restart the `pipelines` container to reload it.
 
-## Caddy proxy (optional)
-Caddy proxies the **ingestor** and **RAG** services at subpaths so you can hit both on one port:
+## Proxy (nginx, optional)
+A stock **nginx** container proxies ingestor and RAG at subpaths and sends everything else to Open WebUI. No custom build (works behind a proxy). `sub_filter` rewrites responses so Swagger at `/rag/docs` and `/ingestor/docs` load the spec and "Try it out" uses the correct base path.
 
-- **Ingestor (8082)**: `http://localhost:2080/ingestor/...` → `ingestor-server:8082`
-- **RAG (8081)**: `http://localhost:2080/rag/...` → `rag-server:8081`
+- **Ingestor (8082)**: `http://localhost/ingestor/...` → `ingestor-server:8082`
+- **RAG (8081)**: `http://localhost/rag/...` → `rag-server:8081`
+- **Open WebUI**: `http://localhost/` → `open-webui:8080`
 
-Backends must be on the same Docker network as Caddy (e.g. `nvidia-rag`). Set `CADDY_HTTP_PORT` in `.env` to change the host port (default `2080`). Edit `docker/caddy/Caddyfile` if your stack uses different service names (e.g. `nvidia-ingestor`, `nvidia-rag-api`).
+Set `PROXY_HTTP_PORT` in `.env` to change the host port (default `80`). Edit `docker/nginx/default.conf` if your stack uses different backend hostnames.
+
+## API reference (Ingestor + RAG)
+For **all HTTP requests** to the NVIDIA Ingestor and RAG servers (upload documents, create/list/delete collections, RAG chat completions, health checks), see **[docs/NVIDIA_RAG_API_REQUESTS.md](docs/NVIDIA_RAG_API_REQUESTS.md)**. That doc includes method, path, headers, body, and curl examples for both services.
 
 ## Direct worker calls (optional)
 You can test the worker directly.
