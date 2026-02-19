@@ -180,7 +180,7 @@ Notes:
 
 **How to verify RAG is working:** (1) **Content check:** Ask a question only your ingested docs can answer; if the answer reflects that content, retrieval is working. (2) **Worker/Milvus logs:** Tail the worker to see that search and Milvus are used:  
 `docker compose logs -f nvidia-rag-worker`  
-You should see lines like: `GET /collections?...` (200), `RAG PIPELINE START - search() method invoked`, `Search Parameters:` with your query and collection names (e.g. `owui_u_anon_library`). For ingest, look for `Ingest request:` and `Ingest complete (Milvus):` per file. The worker sets the RAG pipeline logger to INFO so these lines are visible by default.
+You should see: **RAG querying** — `RAG query (generate):` or `RAG query (search):` with collections and (for search) the user query; then SDK lines `RAG PIPELINE START - search() method invoked`, `Search Parameters:` with query and collection names (e.g. `owui_u_anon_library`). **Collections:** `GET /collections?...` (200). **Ingest:** `Ingest request:` and `Ingest complete (Milvus):` per file. The worker sets the RAG pipeline logger to INFO so these lines are visible by default.
 
 Collection naming conventions (prefix defaults to `owui`):
 - Knowledge base: `owui-kb-<kb_id>` or `owui-kb-public-<kb_id>`

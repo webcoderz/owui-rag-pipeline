@@ -540,6 +540,12 @@ async def generate(payload: Dict[str, Any]):
 
     # Backend A: use NVIDIA RAG SDK generation (defaults to NVIDIA model stack)
     if generation_backend in ("nvidia", "nvidia_rag", "sdk"):
+        if use_knowledge_base and collection_names:
+            logger.info(
+                "RAG query (generate): collections=%s vdb_endpoint=%s",
+                collection_names,
+                vdb_endpoint,
+            )
         gen_kwargs: Dict[str, Any] = {
             "messages": messages,
             "use_knowledge_base": use_knowledge_base,
@@ -574,6 +580,12 @@ async def generate(payload: Dict[str, Any]):
             try:
                 query = _get_last_user_text(messages)
                 if query:
+                    logger.info(
+                        "RAG query (search): query=%r collections=%s vdb_endpoint=%s",
+                        query,
+                        collection_names,
+                        vdb_endpoint,
+                    )
                     search_kwargs = {"query": query, "collection_names": collection_names, "vdb_endpoint": vdb_endpoint}
                     search_kwargs = _filter_kwargs_for_callable(rag.search, search_kwargs)
                     citations = await _maybe_await(rag.search(**search_kwargs))
