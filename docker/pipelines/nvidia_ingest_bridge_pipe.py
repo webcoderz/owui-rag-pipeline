@@ -97,6 +97,25 @@ def _json_completion(model: str, content: str) -> dict:
     }
 
 
+def _extract_content_from_sse_chunk(line: str) -> Optional[str]:
+    """Parse a 'data: {...}' SSE line and return choices[0].delta.content if present."""
+    if not line or not line.startswith("data:"):
+        return None
+    rest = line[len("data:") :].strip()
+    if not rest or rest == "[DONE]":
+        return None
+    try:
+        obj = json.loads(rest)
+        choices = obj.get("choices") or []
+        if not choices:
+            return None
+        delta = choices[0].get("delta") or {}
+        c = delta.get("content")
+        return c if isinstance(c, str) else None
+    except Exception:
+        return None
+
+
 class Pipeline:
     class Valves(BaseModel):
         # Open WebUI
@@ -1446,8 +1465,21 @@ class Pipeline:
                 )
             if text.startswith("/"):
                 return _json_completion(model_id, f"Unknown command: {text}. Try /commands.")
-            # Default non-stream fallback: tell OWUI we stream by default.
-            return _json_completion(model_id, "This pipeline is configured for streaming responses.")
+            # Non-stream request (e.g. follow-up suggestions or client sent stream=false):
+            # run the same flow and collect all streamed content so the UI gets a real completion.
+            content_parts: List[str] = []
+            try:
+                async for chunk in runner():
+                    part = _extract_content_from_sse_chunk(chunk)
+                    if part:
+                        content_parts.append(part)
+            except Exception as e:
+                logger.exception("Non-stream runner collection failed")
+                content_parts.append(f"❌ Error: {e}\n")
+            return _json_completion(
+                model_id,
+                "".join(content_parts).strip() or "No response generated. Try again with streaming enabled, or check worker logs.",
+            )
 
         # Stream path: return a *sync* generator (some Pipelines deployments don't iterate async generators).
         return _sync_stream_from_async(runner())
