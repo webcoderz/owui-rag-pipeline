@@ -262,10 +262,17 @@ async def ingest(
     Accepts a single file (multipart upload). Pipelines calls this concurrently (bounded).
     """
     # Create collection if it doesn't exist; if it already exists we continue and ingest into it.
+    # IMPORTANT: SDK may return a coroutine — must await so the collection is actually created.
     try:
-        ingestor.create_collection(collection_name=collection_name, vdb_endpoint=vdb_endpoint)
-    except Exception:
-        pass  # e.g. already exists — proceed to upload_documents into the existing collection
+        await _maybe_await(
+            ingestor.create_collection(collection_name=collection_name, vdb_endpoint=vdb_endpoint)
+        )
+    except Exception as e:
+        err_msg = (getattr(e, "message", None) or str(e)).lower()
+        if "already exists" in err_msg or "duplicate" in err_msg:
+            pass  # proceed to upload_documents into the existing collection
+        else:
+            raise  # don't hide real errors (e.g. invalid name); otherwise upload_documents would fail with "collection does not exist"
 
     # write to temp file because upload_documents expects filepaths
     tmp_path = None
