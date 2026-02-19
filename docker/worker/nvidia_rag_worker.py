@@ -50,6 +50,7 @@ if os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY"):
 from nvidia_rag import NvidiaRAG, NvidiaRAGIngestor
 
 app = FastAPI(title="nvidia-rag-worker", version="1.0.0")
+logger = logging.getLogger(__name__)
 
 rag = NvidiaRAG()
 ingestor = NvidiaRAGIngestor()
@@ -105,6 +106,10 @@ def _suppress_benign_milvus_warnings():
     finally:
         root.removeFilter(filt)
 
+
+# Ensure RAG pipeline (search/ingest) logs are visible so you can confirm Milvus is used.
+_rag_main = logging.getLogger("nvidia_rag.rag_server.main")
+_rag_main.setLevel(logging.INFO)
 
 # Suppress benign Milvus warnings: add filter to SDK loggers and to root (catches any hierarchy).
 # Also set the Milvus VDB logger to ERROR so WARNINGs are not emitted even if filter is bypassed.
@@ -324,6 +329,8 @@ async def ingest(
     Ingest one document into a collection using NvidiaRAGIngestor.
     Accepts a single file (multipart upload). Pipelines calls this concurrently (bounded).
     """
+    original_filename = (file.filename or "").strip() or "upload"
+    logger.info("Ingest request: collection=%s vdb=%s file=%s", collection_name, vdb_endpoint, original_filename)
     # Create collection if it doesn't exist (with metadata schema for filename + uploaded_at).
     # If it already exists we continue and ingest into it (existing collections may have no schema).
     # IMPORTANT: SDK may return a coroutine — must await so the collection is actually created.
@@ -345,7 +352,6 @@ async def ingest(
     # write to temp file because upload_documents expects filepaths
     tmp_path = None
     tmp_dir = None
-    original_filename = (file.filename or "").strip() or "upload"
     uploaded_at_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     safe_name = _safe_upload_filename(file.filename)
 
@@ -382,6 +388,7 @@ async def ingest(
                 resp = await _maybe_await(ingestor.upload_documents(**upload_kw))
             else:
                 raise
+        logger.info("Ingest complete (Milvus): collection=%s file=%s", collection_name, original_filename)
         return JSONResponse(resp)
 
     finally:

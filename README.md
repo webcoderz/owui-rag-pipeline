@@ -172,12 +172,15 @@ In Open WebUI:
   - `/forget` — clear this chat's remembered collections; next message won't use RAG until you attach again or use `/query <collection>`
 
 Notes:
+- **/ingest only uses files attached to the message you send.** If you remove the PDFs from the chat and then send `/ingest library`, the request has no files, so nothing is ingested and the worker is never called (no "Ingest request" / "Ingest complete (Milvus)" logs). Attach the files again and send `/ingest` in the same message.
 - **Why does it always query against the doc I attached?** After you attach a document, the pipeline adds that collection to this chat's "remembered" list so every follow-up message uses it for RAG. To stop using the doc in this chat, use **`/forget`**; the next message will then be answered without RAG unless you attach files again or use `/query <collection> <question>`.
 
 - These are not Open WebUI “tool” slash commands, so they won’t autocomplete; they work only when you’re chatting with the pipeline model.
 - For a UI-native tools experience, use the OpenAPI tools server (`owui-rag-tools`) above.
 
-**How to verify RAG is working:** Ask a question that only your ingested documents can answer (e.g. a specific term or procedure from a file you uploaded). If the answer reflects that content, retrieval is working. The NVIDIA RAG SDK sometimes logs "RAG PIPELINE START - search() method invoked" and "Search Parameters"; depending on SDK version and log level, those lines may not appear even when search runs. Their absence does not mean RAG is off—use the content test above.
+**How to verify RAG is working:** (1) **Content check:** Ask a question only your ingested docs can answer; if the answer reflects that content, retrieval is working. (2) **Worker/Milvus logs:** Tail the worker to see that search and Milvus are used:  
+`docker compose logs -f nvidia-rag-worker`  
+You should see lines like: `GET /collections?...` (200), `RAG PIPELINE START - search() method invoked`, `Search Parameters:` with your query and collection names (e.g. `owui_u_anon_library`). For ingest, look for `Ingest request:` and `Ingest complete (Milvus):` per file. The worker sets the RAG pipeline logger to INFO so these lines are visible by default.
 
 Collection naming conventions (prefix defaults to `owui`):
 - Knowledge base: `owui-kb-<kb_id>` or `owui-kb-public-<kb_id>`
@@ -246,6 +249,7 @@ If your OWUI version supports listing knowledge bases at `GET /api/v1/knowledge`
 - Milvus:
   - Verify it’s reachable at `VDB_ENDPOINT` and the collection prefix has permissions to create collections
   - **Warnings "no entities found in collection metadata_scheme/document_info for filter"**: The NVIDIA RAG SDK may query internal Milvus collections (`metadata_scheme`, `document_info`) for catalog/metadata. If you haven't ingested catalog-style data, those collections are empty and the SDK logs a warning. These are **benign** and can be ignored; RAG search uses your document collections, not these.
+- **No ingest logs / "doesn't recall the documents" after deleting PDFs:** The pipeline only ingests files that Open WebUI sends in **that request** (`body.files` = attachments on the current message). If you remove the PDFs from the chat and then send `/ingest library`, there are no files in the request, so you get "📎 No attachments/knowledge selected" and the worker is never called—no "Ingest request" or "Ingest complete (Milvus)" in the worker logs. **Fix:** Attach the files again and send `/ingest <collection>` in the same message (or keep the attachments on the message). After a successful ingest, the worker logs one "Ingest request" and one "Ingest complete (Milvus)" per file.
 - **Ingest → query flow and the 200 on POST /generate**: When you attach files and send a message, the pipeline (1) ingests into collections and streams status ("✅ Ingestion complete.", "📂 Ingested into: `collection-name`"), (2) then runs the RAG query and streams "💬 Querying…" followed by the model reply. The **200** on `POST /generate` is the worker's successful completion of that RAG request. So: ingest messages first, then "Querying…", then the response; the 200 is expected and indicates the answer was generated successfully.
 
 ## Production checklist (high-signal)
