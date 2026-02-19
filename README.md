@@ -211,6 +211,8 @@ If your OWUI version supports listing knowledge bases at `GET /api/v1/knowledge`
   - Data is stored in the `owui_pg` volume; remove with care if you need a reset
 - Milvus:
   - Verify it’s reachable at `VDB_ENDPOINT` and the collection prefix has permissions to create collections
+  - **Warnings "no entities found in collection metadata_scheme/document_info for filter"**: The NVIDIA RAG SDK may query internal Milvus collections (`metadata_scheme`, `document_info`) for catalog/metadata. If you haven't ingested catalog-style data, those collections are empty and the SDK logs a warning. These are **benign** and can be ignored; RAG search uses your document collections, not these.
+- **Ingest → query flow and the 200 on POST /generate**: When you attach files and send a message, the pipeline (1) ingests into collections and streams status ("✅ Ingestion complete.", "📂 Ingested into: `collection-name`"), (2) then runs the RAG query and streams "💬 Querying…" followed by the model reply. The **200** on `POST /generate` is the worker's successful completion of that RAG request. So: ingest messages first, then "Querying…", then the response; the 200 is expected and indicates the answer was generated successfully.
 
 ## Production checklist (high-signal)
 - **MinIO**: `MINIO_ENDPOINT` must be a Docker-reachable hostname (never `localhost` inside containers). The SDK requires **`MINIO_BUCKET`** for “retrieve collections” and ingest; set it to a bucket that exists in MinIO (e.g. `nv-ingest`, or `default-bucket` / `a-bucket` if that’s what you have). Create the bucket in MinIO if needed.

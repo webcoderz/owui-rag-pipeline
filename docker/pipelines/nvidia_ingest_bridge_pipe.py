@@ -1103,6 +1103,11 @@ class Pipeline:
                         # Persist chat remember-set for what we just ingested (helps /query defaults)
                         if newly_used:
                             await self._allowlist_add(user_key, chat_id, list(dict.fromkeys(newly_used)))
+                        # Clear acknowledgement so the user sees where docs were ingested
+                        if newly_used:
+                            await emit(f"✅ Ingested into collection(s): {', '.join(f'`{c}`' for c in newly_used)}. You can use /query or ask a question now.\n")
+                        else:
+                            await emit("✅ No new files to ingest (no attachments or KB selected).\n")
 
                 task = asyncio.create_task(do_ingest())
                 try:
@@ -1386,6 +1391,8 @@ class Pipeline:
                             )
 
                     await emit("✅ Ingestion complete.\n")
+                    if newly_used:
+                        await emit(f"📂 Ingested into: {', '.join(f'`{c}`' for c in newly_used)}\n")
 
                     # Persist chat remember-set
                     if newly_used:
