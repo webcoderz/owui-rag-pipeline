@@ -100,12 +100,19 @@ def _suppress_benign_milvus_warnings():
         root.removeFilter(filt)
 
 
-# Install filter on SDK loggers so benign Milvus warnings are suppressed for all operations (generate, ingest, list).
+# Suppress benign Milvus warnings: add filter to SDK loggers and to root (catches any hierarchy).
+# Also set the Milvus VDB logger to ERROR so WARNINGs are not emitted even if filter is bypassed.
 for _logger_name in ("nvidia_rag.utils.vdb.milvus.milvus_vdb", "nvidia_rag.utils.vdb.milvus", "nvidia_rag"):
     _log = logging.getLogger(_logger_name)
     _f = logging.Filter()
     _f.filter = _benign_milvus_filter  # type: ignore[method-assign]
     _log.addFilter(_f)
+    if "milvus_vdb" in _logger_name:
+        _log.setLevel(logging.ERROR)
+_root = logging.getLogger()
+_root_f = logging.Filter()
+_root_f.filter = _benign_milvus_filter  # type: ignore[method-assign]
+_root.addFilter(_root_f)
 
 
 async def _call_ingestor_first(method_names: List[str], **kwargs):

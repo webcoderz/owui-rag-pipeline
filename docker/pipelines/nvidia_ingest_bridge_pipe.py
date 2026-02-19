@@ -98,7 +98,7 @@ def _json_completion(model: str, content: str) -> dict:
 
 
 def _extract_content_from_sse_chunk(line: str) -> Optional[str]:
-    """Parse a 'data: {...}' SSE line and return choices[0].delta.content if present."""
+    """Parse a 'data: {...}' SSE line; return choices[0].delta.content or choices[0].message.content."""
     if not line or not line.startswith("data:"):
         return None
     rest = line[len("data:") :].strip()
@@ -109,8 +109,15 @@ def _extract_content_from_sse_chunk(line: str) -> Optional[str]:
         choices = obj.get("choices") or []
         if not choices:
             return None
-        delta = choices[0].get("delta") or {}
+        choice = choices[0]
+        # Streaming chunks use delta.content
+        delta = choice.get("delta") or {}
         c = delta.get("content")
+        if isinstance(c, str):
+            return c
+        # Non-streaming or final chunk may use message.content
+        msg = choice.get("message") or {}
+        c = msg.get("content")
         return c if isinstance(c, str) else None
     except Exception:
         return None
