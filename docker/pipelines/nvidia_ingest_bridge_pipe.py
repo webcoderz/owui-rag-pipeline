@@ -641,6 +641,7 @@ class Pipeline:
         collection_name: str,
         filename: str,
         tmp_path: str,
+        uploaded_by: Optional[str] = None,
     ) -> dict:
         milvus_name = self._to_milvus_safe_collection_name(collection_name) or collection_name
         form = {
@@ -651,6 +652,8 @@ class Pipeline:
             "chunk_overlap": str(self.valves.CHUNK_OVERLAP),
             "generate_summary": "false",
         }
+        if (uploaded_by or "").strip():
+            form["uploaded_by"] = (uploaded_by or "").strip()
         with open(tmp_path, "rb") as f:
             files = {"file": (filename, f)}
             r = await client.post(
@@ -788,6 +791,7 @@ class Pipeline:
         emit,
         model_id: str,
         user_token: Optional[str] = None,
+        uploaded_by: Optional[str] = None,  # safe user id for document metadata (audit); access control is at OWUI level
     ) -> None:
         sem = asyncio.Semaphore(self.valves.MAX_PARALLEL_FILE_INGEST)
         total = len(entries)
@@ -822,7 +826,9 @@ class Pipeline:
                         return
 
                     await emit(f"📤 Uploading `{filename}` to RAG…\n")
-                    await self._call_worker_ingest_from_path(worker_client, collection_name, filename, tmp_path)
+                    await self._call_worker_ingest_from_path(
+                        worker_client, collection_name, filename, tmp_path, uploaded_by=uploaded_by
+                    )
                     await self._manifest_set(file_id, collection_name, sha, "success")
                     await emit(f"✅ Indexed: `{filename}`\n")
 
@@ -1135,7 +1141,8 @@ class Pipeline:
                             await emit(f"📥 KB files: {len(entries)}\n")
 
                             await self._ingest_entries_into_collection(
-                                ow_client, worker_client, entries, kb_collection, emit, model_id, user_token=user_token
+                                ow_client, worker_client, entries, kb_collection, emit, model_id,
+                                user_token=user_token, uploaded_by=self._safe_user_key(user_key),
                             )
                             newly_used.append(kb_collection)
 
@@ -1150,7 +1157,8 @@ class Pipeline:
                                 entries2.append((fid, fname))
                             await emit(f"📥 Uploads: {len(entries2)}\n")
                             await self._ingest_entries_into_collection(
-                                ow_client, worker_client, entries2, chat_collection, emit, model_id, user_token=user_token
+                                ow_client, worker_client, entries2, chat_collection, emit, model_id,
+                                user_token=user_token, uploaded_by=self._safe_user_key(user_key),
                             )
                             newly_used.append(chat_collection)
 
@@ -1404,14 +1412,16 @@ class Pipeline:
 
                         await emit(f"📥 KB files: {len(entries)}\n")
                         await self._ingest_entries_into_collection(
-                            ow_client, worker_client, entries, kb_collection, emit, model_id, user_token=user_token
+                            ow_client, worker_client, entries, kb_collection, emit, model_id,
+                            user_token=user_token, uploaded_by=self._safe_user_key(user_key),
                         )
                         newly_used.append(kb_collection)
 
                         if save_to_library:
                             await emit(f"📚 Saving KB docs to your library → `{lib_collection}`\n")
                             await self._ingest_entries_into_collection(
-                                ow_client, worker_client, entries, lib_collection, emit, model_id, user_token=user_token
+                                ow_client, worker_client, entries, lib_collection, emit, model_id,
+                                user_token=user_token, uploaded_by=self._safe_user_key(user_key),
                             )
 
                     # Ad-hoc uploads
@@ -1434,14 +1444,16 @@ class Pipeline:
 
                         await emit(f"📥 Uploads: {len(entries)}\n")
                         await self._ingest_entries_into_collection(
-                            ow_client, worker_client, entries, chat_collection, emit, model_id, user_token=user_token
+                            ow_client, worker_client, entries, chat_collection, emit, model_id,
+                            user_token=user_token, uploaded_by=self._safe_user_key(user_key),
                         )
                         newly_used.append(chat_collection)
 
                         if save_to_library:
                             await emit(f"📚 Saving uploads to your library → `{lib_collection}`\n")
                             await self._ingest_entries_into_collection(
-                                ow_client, worker_client, entries, lib_collection, emit, model_id, user_token=user_token
+                                ow_client, worker_client, entries, lib_collection, emit, model_id,
+                                user_token=user_token, uploaded_by=self._safe_user_key(user_key),
                             )
 
                     await emit("✅ Ingestion complete.\n")

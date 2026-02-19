@@ -16,7 +16,7 @@ This repo wires Open WebUI Pipelines to an NVIDIA RAG worker (Python SDK) and a 
   - Tracks ingest status in Postgres
   - Supports per-user library and chat allowlist
 
-**Ingest metadata:** The worker creates collections with a metadata schema and stores **filename** (original upload name) and **uploaded_at** (ISO 8601 timestamp) per document. This enables filtering and display in the RAG layer. Collections created before this feature have no schema; uploads to them skip metadata (backward compatible).
+**Ingest metadata:** The worker creates collections with a metadata schema and stores **filename** (original upload name), **uploaded_at** (ISO 8601 timestamp), and **uploaded_by** (OWUI user id, for audit/attribution) per document. Access control remains at the OWUI/pipeline level (collection naming and which collections are queried); `uploaded_by` is for display and filtering only. Collections created before this feature have no schema; uploads to them skip metadata (backward compatible).
 
 ### Access control (OWUI–Milvus linking)
 

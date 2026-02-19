@@ -341,7 +341,7 @@ async def ingest(
         meta: Dict[str, Any] = {"filename": original_filename, "uploaded_at": uploaded_at_iso}
         if (uploaded_by or "").strip():
             meta["uploaded_by"] = (uploaded_by or "").strip()[:512]  # cap length
-        upload_kw = {
+        upload_kw: Dict[str, Any] = {
             "collection_name": collection_name,
             "vdb_endpoint": vdb_endpoint,
             "blocking": blocking,
