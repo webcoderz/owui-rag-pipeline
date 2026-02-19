@@ -6,6 +6,7 @@ requirements: httpx, asyncpg
 """
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -635,14 +636,34 @@ class Pipeline:
     # -----------------------
     # Main pipe
     # -----------------------
+    # Open WebUI Pipelines may call pipe() without awaiting (sync call). We expose a sync pipe()
+    # that runs the async implementation so both "await pipeline.pipe()" and "pipeline.pipe()" work.
 
-    async def pipe(
+    def pipe(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        user_message: Optional[str] = None,
+        **kwargs,
+    ):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            return asyncio.run(self._pipe_async(body, __user__=__user__, user_message=user_message, **kwargs))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(
+                asyncio.run,
+                self._pipe_async(body, __user__=__user__, user_message=user_message, **kwargs),
+            )
+            return future.result()
+
+    async def _pipe_async(
         self,
         body: dict,
         __user__: Optional[dict] = None,
         # Open WebUI Pipelines may pass extra kwargs depending on version.
-        # Accept them to avoid runtime crashes like:
-        #   TypeError: Pipeline.pipe() got unexpected keyword argument 'user_message'
         user_message: Optional[str] = None,
         **kwargs,
     ):

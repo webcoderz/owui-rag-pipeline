@@ -145,6 +145,12 @@ Collection naming conventions (prefix defaults to `owui`):
 - Library: `owui-u-<user>-library`
 
 ## Troubleshooting
+- **"coroutine Pipeline.pipe was never awaited"**  
+  The pipeline exposes a synchronous `pipe()` so Open WebUI can call it without `await`. If you still see this, ensure you’re on the latest pipeline image and that the Pipelines service has been restarted after an update.
+- **/commands, /help, or /library off does nothing**  
+  Usually the same cause as above: the runtime wasn’t awaiting `pipe()`. With the sync wrapper, slash commands should return immediately. Send the command as the only content in the message (e.g. type `/library off` and send).
+- **Pipeline keeps re-ingesting or “retrieving” the same document**  
+  If the chat request still includes the same attachments on every turn, the pipeline will ingest again each time. Send a message *without* new attachments for plain chat or slash commands (e.g. `/library off`, `/help`, or a question). Clear or don’t re-attach the file for the next message.
 - Proxies:
   - Set `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` in `.env`
   - Ensure `NO_PROXY` includes internal names: `open-webui,pipelines,nvidia-rag-worker,owui-postgres,milvus,localhost,127.0.0.1`
