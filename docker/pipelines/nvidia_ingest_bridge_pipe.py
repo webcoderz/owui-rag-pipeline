@@ -31,6 +31,7 @@ def _now() -> int:
 
 
 def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> str:
+    """Open WebUI Pipelines server expects lines starting with 'data:'; it adds '\\n\\n' itself."""
     delta: Dict[str, Any] = {}
     if role:
         delta["role"] = role
@@ -41,19 +42,27 @@ def _sse_chunk(model: str, content: str = "", role: Optional[str] = None) -> str
         "object": "chat.completion.chunk",
         "created": _now(),
         "model": model or "nvidia-rag-auto-ingest",
-        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "logprobs": None,
+                "finish_reason": None,
+            }
+        ],
     }
-    return f"data: {json.dumps(payload)}\n\n"
+    return f"data: {json.dumps(payload)}"
 
 
 def _sse_done(_: str) -> str:
-    return "data: [DONE]\n\n"
+    """Pipelines server adds '\\n\\n'; yield only the event line."""
+    return "data: [DONE]"
 
 
 def _parse_worker_sse_line(model: str, line: str) -> Optional[str]:
     """
-    Worker streams OpenAI-style SSE lines. The Pipelines runtime usually handles SSE framing,
-    so we convert lines to chunk dicts here.
+    Worker streams OpenAI-style SSE lines. Return event lines without trailing \\n\\n
+    so the Pipelines server can add them (stream_content yields f"{line}\\n\\n").
     """
     if not line:
         return None
@@ -64,13 +73,11 @@ def _parse_worker_sse_line(model: str, line: str) -> Optional[str]:
         line = line[len("data:") :].strip()
     if not line or line == "[DONE]":
         return _sse_done(model)
-    # Ensure "data:" prefix
     if line.startswith("{") and line.endswith("}"):
-        return "data: " + line + "\n\n"
+        return "data: " + line
     if line.startswith("data:"):
-        # normalize trailing newlines
-        return line + ("\n\n" if not line.endswith("\n\n") else "")
-    return "data: " + line + "\n\n"
+        return line.rstrip()
+    return "data: " + line
 
 
 def _json_completion(model: str, content: str) -> dict:
