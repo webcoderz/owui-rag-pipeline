@@ -16,6 +16,8 @@ This repo wires Open WebUI Pipelines to an NVIDIA RAG worker (Python SDK) and a 
   - Tracks ingest status in Postgres
   - Supports per-user library and chat allowlist
 
+**Ingest metadata:** The worker creates collections with a metadata schema and stores **filename** (original upload name) and **uploaded_at** (ISO 8601 timestamp) per document. This enables filtering and display in the RAG layer. Collections created before this feature have no schema; uploads to them skip metadata (backward compatible).
+
 ### Access control (OWUI–Milvus linking)
 
 Collections are scoped so Milvus usage respects Open WebUI permissions:
@@ -146,8 +148,11 @@ In Open WebUI:
    - `/query chat <question>` / `/query library <question>` — shorthand for derived collections
    - `/delete <collection> <filename>` — delete a document from a collection (uses worker `DELETE /v1/documents`)
    - `/delete chat <filename>` / `/delete library <filename>` — shorthand for derived collections
+  - `/forget` — clear this chat's remembered collections; next message won't use RAG until you attach again or use `/query <collection>`
 
 Notes:
+- **Why does it always query against the doc I attached?** After you attach a document, the pipeline adds that collection to this chat's "remembered" list so every follow-up message uses it for RAG. To stop using the doc in this chat, use **`/forget`**; the next message will then be answered without RAG unless you attach files again or use `/query <collection> <question>`.
+
 - These are not Open WebUI “tool” slash commands, so they won’t autocomplete; they work only when you’re chatting with the pipeline model.
 - For a UI-native tools experience, use the OpenAPI tools server (`owui-rag-tools`) above.
 

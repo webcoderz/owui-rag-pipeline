@@ -1,9 +1,12 @@
 import asyncio
 import inspect
 import json
+import logging
 import os
 import tempfile
 import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -45,6 +48,13 @@ app = FastAPI(title="nvidia-rag-worker", version="1.0.0")
 rag = NvidiaRAG()
 ingestor = NvidiaRAGIngestor()
 
+# Default metadata schema for ingest: filename + upload time (enables filtering and display).
+# Collections created without this schema will not accept custom_metadata; we fall back to no metadata.
+DEFAULT_METADATA_SCHEMA = [
+    {"name": "filename", "type": "string", "required": False, "description": "Original upload filename"},
+    {"name": "uploaded_at", "type": "string", "required": False, "description": "ISO 8601 upload timestamp"},
+]
+
 
 def _filter_kwargs_for_callable(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -63,6 +73,31 @@ async def _maybe_await(value):
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+@contextmanager
+def _suppress_benign_milvus_warnings():
+    """
+    Suppress known-benign Milvus/SDK warnings during collection listing.
+    The NVIDIA RAG SDK may query internal collections (metadata_scheme, document_info)
+    that are empty when no catalog-style data is ingested; those warnings are harmless.
+    """
+    class _Filter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = (record.getMessage() or "")
+            if "no entities found" not in msg.lower():
+                return True
+            if "metadata_scheme" in msg or "document_info" in msg:
+                return False
+            return True
+
+    filt = _Filter()
+    root = logging.getLogger()
+    root.addFilter(filt)
+    try:
+        yield
+    finally:
+        root.removeFilter(filt)
 
 
 async def _call_ingestor_first(method_names: List[str], **kwargs):
@@ -266,12 +301,17 @@ async def ingest(
     Ingest one document into a collection using NvidiaRAGIngestor.
     Accepts a single file (multipart upload). Pipelines calls this concurrently (bounded).
     """
-    # Create collection if it doesn't exist; if it already exists we continue and ingest into it.
+    # Create collection if it doesn't exist (with metadata schema for filename + uploaded_at).
+    # If it already exists we continue and ingest into it (existing collections may have no schema).
     # IMPORTANT: SDK may return a coroutine — must await so the collection is actually created.
     try:
-        await _maybe_await(
-            ingestor.create_collection(collection_name=collection_name, vdb_endpoint=vdb_endpoint)
-        )
+        create_kw = {
+            "collection_name": collection_name,
+            "vdb_endpoint": vdb_endpoint,
+            "metadata_schema": DEFAULT_METADATA_SCHEMA,
+        }
+        create_kw = _filter_kwargs_for_callable(ingestor.create_collection, create_kw)
+        await _maybe_await(ingestor.create_collection(**create_kw))
     except Exception as e:
         err_msg = (getattr(e, "message", None) or str(e)).lower()
         if "already exists" in err_msg or "duplicate" in err_msg:
@@ -282,23 +322,45 @@ async def ingest(
     # write to temp file because upload_documents expects filepaths
     tmp_path = None
     tmp_dir = None
+    original_filename = (file.filename or "").strip() or "upload"
+    uploaded_at_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    safe_name = _safe_upload_filename(file.filename)
+
     try:
         # Create a per-request directory and write the file using the *original* filename
         # (sanitized). This allows later delete-by-document-name to work consistently.
         tmp_dir = tempfile.mkdtemp(prefix="owui_upload_")
-        tmp_path = os.path.join(tmp_dir, _safe_upload_filename(file.filename))
+        tmp_path = os.path.join(tmp_dir, safe_name)
         with open(tmp_path, "wb") as tmp:
             content = await file.read()
             tmp.write(content)
 
-        resp = await ingestor.upload_documents(
-            collection_name=collection_name,
-            vdb_endpoint=vdb_endpoint,
-            blocking=blocking,
-            split_options={"chunk_size": chunk_size, "chunk_overlap": chunk_overlap},
-            filepaths=[tmp_path],
-            generate_summary=generate_summary,
-        )
+        upload_kw: Dict[str, Any] = {
+            "collection_name": collection_name,
+            "vdb_endpoint": vdb_endpoint,
+            "blocking": blocking,
+            "split_options": {"chunk_size": chunk_size, "chunk_overlap": chunk_overlap},
+            "filepaths": [tmp_path],
+            "generate_summary": generate_summary,
+            "custom_metadata": [
+                {
+                    "filename": safe_name,
+                    "metadata": {"filename": original_filename, "uploaded_at": uploaded_at_iso},
+                }
+            ],
+        }
+        upload_kw = _filter_kwargs_for_callable(ingestor.upload_documents, upload_kw)
+
+        try:
+            resp = await _maybe_await(ingestor.upload_documents(**upload_kw))
+        except Exception as meta_err:
+            # Collection may have been created earlier without metadata_schema; retry without custom_metadata.
+            err_str = (getattr(meta_err, "message", None) or str(meta_err)).lower()
+            if "metadata" in err_str or "schema" in err_str:
+                upload_kw.pop("custom_metadata", None)
+                resp = await _maybe_await(ingestor.upload_documents(**upload_kw))
+            else:
+                raise
         return JSONResponse(resp)
 
     finally:
@@ -325,10 +387,11 @@ async def list_collections(
     """
     vdb = (vdb_endpoint or os.getenv("VDB_ENDPOINT") or "http://milvus:19530").strip()
     try:
-        result = await _call_ingestor_first(
-            ["get_collections", "list_collections"],
-            vdb_endpoint=vdb,
-        )
+        with _suppress_benign_milvus_warnings():
+            result = await _call_ingestor_first(
+                ["get_collections", "list_collections"],
+                vdb_endpoint=vdb,
+            )
         if result is None:
             return JSONResponse({"collections": []})
         if isinstance(result, list):

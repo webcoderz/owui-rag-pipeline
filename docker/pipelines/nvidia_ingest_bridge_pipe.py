@@ -437,6 +437,15 @@ class Pipeline:
                 values
             )
 
+    async def _allowlist_clear(self, user_key: str, chat_id: str) -> None:
+        """Remove all remembered collections for this chat so the next message won't use RAG unless user attaches again."""
+        pool = await self._db()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM chat_allowlist WHERE user_key=$1 AND chat_id=$2",
+                user_key, chat_id
+            )
+
     async def _library_include_by_default(self, user_key: str) -> bool:
         pool = await self._db()
         now = _now()
@@ -949,6 +958,7 @@ class Pipeline:
         commands_text = (
             "Commands:\n"
             "- /collection list — show this chat’s known/remembered collections\n"
+            "- /forget — clear this chat's remembered collections (next message won't use RAG until you attach again)\n"
             "- /library on — save future ingests to your library\n"
             "- /library off — do not save future ingests to your library\n"
             "- /library — show this chat's current save-to-library setting\n"
@@ -1009,6 +1019,31 @@ class Pipeline:
             if stream:
                 return _sync_stream_from_async(collections_stream())
             return _json_completion(model_id, "Use stream=true for /collection list.")
+
+        # /forget: clear this chat's remembered collections so next message won't use RAG unless user attaches again
+        if text == "/forget":
+            async def forget_stream():
+                yield _sse_chunk(model_id, role="assistant")
+                try:
+                    await self._allowlist_clear(user_key, chat_id)
+                    yield _sse_chunk(
+                        model_id,
+                        "✅ Cleared this chat's remembered collections. Next message won't use RAG unless you attach files or use /query <collection>.\n",
+                    )
+                except Exception as e:
+                    yield _sse_chunk(model_id, f"❌ /forget failed: {e}\n")
+                yield _sse_done(model_id)
+
+            if stream:
+                return _sync_stream_from_async(forget_stream())
+            try:
+                await self._allowlist_clear(user_key, chat_id)
+                return _json_completion(
+                    model_id,
+                    "✅ Cleared this chat's remembered collections. Next message won't use RAG unless you attach files or use /query <collection>.",
+                )
+            except Exception as e:
+                return _json_completion(model_id, f"❌ /forget failed: {e}")
 
         # /library helpers (per-chat toggle)
         if text in ("/library", "/library on", "/library off", "/library true", "/library false", "/library enable", "/library disable"):
@@ -1455,7 +1490,8 @@ class Pipeline:
                     model_id,
                     "Commands:\n"
                     "- /collection list — show this chat’s known/remembered collections\n"
-                    "- /library on — save future ingests to your library\n"
+                    "- /forget — clear this chat's remembered collections (next message won't use RAG until you attach again)\n"
+            "- /library on — save future ingests to your library\n"
                     "- /library off — do not save future ingests to your library\n"
                     "- /library — show this chat's current save-to-library setting\n"
                     "- /ingest [collection] — ingest attachments/KBs and stop (optional target collection)\n"
