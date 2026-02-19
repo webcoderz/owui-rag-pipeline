@@ -24,6 +24,8 @@ services:
 
       # Milvus / vector DB (required for RAG generate and search). Do NOT use localhost inside Docker.
       VDB_ENDPOINT: ${VDB_ENDPOINT:-http://milvus:19530}
+      # NVIDIA RAG SDK may read this at import; keep in sync with VDB_ENDPOINT.
+      APP_VECTORSTORE_URL: ${VDB_ENDPOINT:-http://milvus:19530}
 
       # Optional: use your own OpenAI-compatible (vLLM) model for final generation instead of NVIDIA generation
       # - nvidia: uses NvidiaRAG.generate() (default)

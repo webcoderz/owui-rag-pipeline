@@ -28,6 +28,9 @@ def _set_default_env(name: str, default: str) -> None:
 _set_default_env("MINIO_ENDPOINT", "minio:9010")
 _set_default_env("MINIO_ACCESSKEY", "minioadmin")
 _set_default_env("MINIO_SECRETKEY", "minioadmin")
+_set_default_env("VDB_ENDPOINT", "http://milvus:19530")
+# NVIDIA RAG Blueprint uses APP_VECTORSTORE_URL for Milvus; set from VDB_ENDPOINT so SDK sees it at init.
+_set_default_env("APP_VECTORSTORE_URL", os.getenv("VDB_ENDPOINT", "http://milvus:19530"))
 
 # NVIDIA client SDK (py3.12+)
 from nvidia_rag import NvidiaRAG, NvidiaRAGIngestor
