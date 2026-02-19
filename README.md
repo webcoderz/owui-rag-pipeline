@@ -177,6 +177,8 @@ Notes:
 - These are not Open WebUI “tool” slash commands, so they won’t autocomplete; they work only when you’re chatting with the pipeline model.
 - For a UI-native tools experience, use the OpenAPI tools server (`owui-rag-tools`) above.
 
+**How to verify RAG is working:** Ask a question that only your ingested documents can answer (e.g. a specific term or procedure from a file you uploaded). If the answer reflects that content, retrieval is working. The NVIDIA RAG SDK sometimes logs "RAG PIPELINE START - search() method invoked" and "Search Parameters"; depending on SDK version and log level, those lines may not appear even when search runs. Their absence does not mean RAG is off—use the content test above.
+
 Collection naming conventions (prefix defaults to `owui`):
 - Knowledge base: `owui-kb-<kb_id>` or `owui-kb-public-<kb_id>`
 - Chat uploads: `owui-u-<user>-chat-<chat_id>` (user-scoped by default)
@@ -232,9 +234,10 @@ If your OWUI version supports listing knowledge bases at `GET /api/v1/knowledge`
 - **Log shows `stream:true:<generator object Pipeline._pipe_async...>`**  
   That log line is from the Pipelines server (it logs the return value of `pipe()`). A **generator** is correct for streaming — it means the pipeline returned a stream. The server then iterates that generator and forwards each chunk to the client. If you previously saw `<coroutine object ...>`, that was the bug (unawaited); seeing `<generator ...>` means the response is set up correctly.
 - **Worker response is HTML / blank UI:** The pipeline’s request to the worker was sent via an HTTP proxy that returned a block page instead of the SSE stream. The pipeline now uses a dedicated HTTP client for worker requests that ignores `HTTP_PROXY` (`trust_env=False`), so worker traffic goes direct. Also set `NO_PROXY` (and `no_proxy`) in the pipelines service so internal hostnames bypass the proxy (see `docker-compose.yaml` default). If the proxy error persists, the **worker** may be the one hitting the proxy when it calls the NVIDIA SDK or OPENAI_BASE_URL. The worker now defaults to `NO_PROXY=*` and disables proxy in code for the OpenAI path; **rebuild the worker** after pulling: `docker compose build nvidia-rag-worker --no-cache && docker compose up -d nvidia-rag-worker`.
+- **Failed to connect to Milvus / "HTTP proxy handshake ... 503" in worker:** The Milvus client (gRPC) and some HTTP stacks do not respect `NO_PROXY`; if the worker has `HTTP_PROXY` set, it sends Milvus and OPENAI_BASE_URL traffic via the proxy and fails. Compose **overrides** proxy to empty for the worker by default. If you must pass a proxy to the worker, set `NO_PROXY` and `no_proxy` so Milvus and the LLM host bypass it, e.g. `no_proxy: "milvus-standalone,<OPENAI_BASE_URL host or IP>"` (use the hostname or IP of your gpt-oss / OPENAI_BASE_URL). Recreate the worker after changing env.
 - Proxies:
-  - Set `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` in `.env`
-  - Pipelines: `NO_PROXY` should include internal hostnames. Worker: default `NO_PROXY=*` so generation never uses proxy.
+  - Set `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` in `.env` for pipelines and build. **Worker does not receive proxy vars** so it can reach Milvus/MinIO directly.
+  - Pipelines: `NO_PROXY` should include internal hostnames (compose default).
   - Ensure `NO_PROXY` includes internal names when not using *: `open-webui,pipelines,nvidia-rag-worker,owui-postgres,milvus,milvus-standalone,localhost,127.0.0.1`
 - Networking:
   - Ensure Open WebUI, pipelines, and worker share an external network and can resolve each other by the names in `docker-compose.yaml`

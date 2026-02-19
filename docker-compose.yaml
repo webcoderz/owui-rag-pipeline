@@ -8,13 +8,12 @@ services:
         HTTP_PROXY: ${HTTP_PROXY}
         HTTPS_PROXY: ${HTTPS_PROXY}
     environment:
-      # Proxy support (optional). Worker outbound calls (NVIDIA SDK, OPENAI_BASE_URL) must NOT go through proxy
-      HTTP_PROXY: ${HTTP_PROXY}
-      HTTPS_PROXY: ${HTTPS_PROXY}
-      http_proxy: ${HTTP_PROXY}
-      https_proxy: ${HTTPS_PROXY}
-      NO_PROXY: ${NO_PROXY:-*}
-      no_proxy: ${NO_PROXY:-*}
+      # Override proxy baked into the image (Dockerfile sets ENV for build). Runtime must not use proxy or
+      # Milvus (gRPC) and OPENAI_BASE_URL requests go via proxy and fail (503 / block page).
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
       # Required for NVIDIA RAG ingestion server internals (MinIO is used at import/startup time)
       # IMPORTANT: Do NOT use localhost here inside Docker. Use a resolvable hostname on the Docker network.
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9010}
