@@ -48,11 +48,13 @@ app = FastAPI(title="nvidia-rag-worker", version="1.0.0")
 rag = NvidiaRAG()
 ingestor = NvidiaRAGIngestor()
 
-# Default metadata schema for ingest: filename + upload time (enables filtering and display).
+# Default metadata schema for ingest: filename, upload time, and optional uploader (enables filtering and display).
 # Collections created without this schema will not accept custom_metadata; we fall back to no metadata.
+# Access control stays at OWUI/pipeline level (collection naming + which collections we query); uploaded_by is for audit/attribution.
 DEFAULT_METADATA_SCHEMA = [
     {"name": "filename", "type": "string", "required": False, "description": "Original upload filename"},
     {"name": "uploaded_at", "type": "string", "required": False, "description": "ISO 8601 upload timestamp"},
+    {"name": "uploaded_by", "type": "string", "required": False, "description": "User identifier (OWUI) who uploaded the document"},
 ]
 
 
@@ -295,6 +297,7 @@ async def ingest(
     chunk_size: int = Form(512),
     chunk_overlap: int = Form(150),
     generate_summary: bool = Form(False),
+    uploaded_by: Optional[str] = Form(default=None),  # OWUI user id/email for audit; access control is at pipeline level
     file: UploadFile = File(...),
 ):
     """
@@ -335,19 +338,17 @@ async def ingest(
             content = await file.read()
             tmp.write(content)
 
-        upload_kw: Dict[str, Any] = {
+        meta: Dict[str, Any] = {"filename": original_filename, "uploaded_at": uploaded_at_iso}
+        if (uploaded_by or "").strip():
+            meta["uploaded_by"] = (uploaded_by or "").strip()[:512]  # cap length
+        upload_kw = {
             "collection_name": collection_name,
             "vdb_endpoint": vdb_endpoint,
             "blocking": blocking,
             "split_options": {"chunk_size": chunk_size, "chunk_overlap": chunk_overlap},
             "filepaths": [tmp_path],
             "generate_summary": generate_summary,
-            "custom_metadata": [
-                {
-                    "filename": safe_name,
-                    "metadata": {"filename": original_filename, "uploaded_at": uploaded_at_iso},
-                }
-            ],
+            "custom_metadata": [{"filename": safe_name, "metadata": meta}],
         }
         upload_kw = _filter_kwargs_for_callable(ingestor.upload_documents, upload_kw)
 
