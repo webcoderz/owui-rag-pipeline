@@ -147,6 +147,7 @@ class Pipeline:
         # container env vars automatically. In production we want env vars to win.
         self._apply_env_valves_overrides()
         self._pool: Optional[asyncpg.Pool] = None
+        self._pool_loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _apply_env_valves_overrides(self) -> None:
         def set_if_env(name: str, caster=lambda x: x):
@@ -175,6 +176,29 @@ class Pipeline:
     # -----------------------
     # Command parsing/helpers
     # -----------------------
+
+    def _last_user_message_text(self, messages: List[dict]) -> str:
+        """
+        Extract plain text from the last user message. Handles both string content
+        and Open WebUI multimodal list content ([{"type": "text", "text": "..."}, ...])
+        so slash commands are always detected and never fall through.
+        """
+        if not messages or messages[-1].get("role") != "user":
+            return ""
+        content = messages[-1].get("content")
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text" and "text" in item:
+                    parts.append(str(item["text"]).strip())
+            return " ".join(parts).strip()
+        return str(content).strip()
 
     def _sanitize_collection_name(self, name: str) -> str:
         """
@@ -207,8 +231,25 @@ class Pipeline:
     # -----------------------
 
     async def _db(self) -> asyncpg.Pool:
+        # Pools are bound to the event loop they were created in. We run in different loops
+        # per request (daemon thread's asyncio.run), so we must not reuse a pool whose loop
+        # is closed — that causes "another operation in progress" and can segfault.
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if self._pool is not None and self._pool_loop is not None:
+            if self._pool_loop.is_closed() or current_loop is not self._pool_loop:
+                old = self._pool
+                self._pool = None
+                self._pool_loop = None
+                try:
+                    await old.close()
+                except Exception as e:
+                    logger.debug("Error closing stale asyncpg pool: %s", e)
         if not self._pool:
             self._pool = await asyncpg.create_pool(self.valves.DATABASE_URL, min_size=1, max_size=10)
+            self._pool_loop = asyncio.get_running_loop()
             await self._init_db()
         return self._pool
 
@@ -645,6 +686,9 @@ class Pipeline:
     # -----------------------
     # Open WebUI Pipelines may call pipe() without awaiting (sync call). We expose a sync pipe()
     # that runs the async implementation so both "await pipeline.pipe()" and "pipeline.pipe()" work.
+    # When stream=True, we return a sync generator. The Pipelines server logs this as
+    # "stream:true:<generator object ...>" — that is expected; the server then iterates it
+    # and forwards SSE to the client.
 
     def pipe(
         self,
@@ -681,11 +725,9 @@ class Pipeline:
         chat_id = body.get("chat_id") or body.get("conversation_id") or body.get("id") or str(_now())
 
         # Prefer runtime-provided `user_message` if present (newer Pipelines versions),
-        # otherwise fall back to the last user message in the chat payload.
+        # otherwise fall back to the last user message (handles string or multimodal list).
         messages = body.get("messages") or []
-        last_user_text = ""
-        if messages and (messages[-1].get("role") == "user"):
-            last_user_text = (messages[-1].get("content") or "")
+        last_user_text = self._last_user_message_text(messages)
         raw_text = ((user_message or last_user_text) or "").strip()
         text = raw_text.lower()
         stream = bool(body.get("stream", True))

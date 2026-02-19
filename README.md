@@ -151,6 +151,10 @@ Collection naming conventions (prefix defaults to `owui`):
   Usually the same cause as above: the runtime wasn’t awaiting `pipe()`. With the sync wrapper, slash commands should return immediately. Send the command as the only content in the message (e.g. type `/library off` and send).
 - **Pipeline keeps re-ingesting or “retrieving” the same document**  
   If the chat request still includes the same attachments on every turn, the pipeline will ingest again each time. Send a message *without* new attachments for plain chat or slash commands (e.g. `/library off`, `/help`, or a question). Clear or don’t re-attach the file for the next message.
+- **Streaming response not showing in UI (logs show completion)**  
+  The pipeline yields SSE event lines in the format the Open WebUI Pipelines server expects (`data: {...}` per line; the server adds `\n\n`). Chunk payloads include `logprobs` and match the OpenAI-style `chat.completion.chunk` shape. If the UI still doesn't update, check that the OpenAI API URL in Open WebUI points at the Pipelines service and that no proxy is buffering or altering the stream.
+- **Log shows `stream:true:<generator object Pipeline._pipe_async...>`**  
+  That log line is from the Pipelines server (it logs the return value of `pipe()`). A **generator** is correct for streaming — it means the pipeline returned a stream. The server then iterates that generator and forwards each chunk to the client. If you previously saw `<coroutine object ...>`, that was the bug (unawaited); seeing `<generator ...>` means the response is set up correctly.
 - Proxies:
   - Set `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` in `.env`
   - Ensure `NO_PROXY` includes internal names: `open-webui,pipelines,nvidia-rag-worker,owui-postgres,milvus,localhost,127.0.0.1`
