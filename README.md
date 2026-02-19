@@ -101,6 +101,27 @@ Readiness check (validates OpenAI/vLLM settings when enabled):
 curl http://localhost:8123/ready
 ```
 
+## Pipeline vs. “your OpenAI model” in Open WebUI
+When you **select the pipeline** as the model in a chat (e.g. “NVIDIA RAG (Auto-Ingest • Library • Persistent)”), Open WebUI sends the request to the **Pipelines** server. The pipeline then calls the **NVIDIA RAG worker** at `POST /generate` — it does **not** call Open WebUI’s chat API or the model you use in other chats (e.g. your OpenAI model).
+
+So the model that actually generates the RAG reply is controlled by the **worker** environment, not by the model dropdown in Open WebUI:
+
+- **`GENERATION_BACKEND=nvidia`** (default): the worker uses the NVIDIA RAG SDK’s built-in generation (NVIDIA NIM/catalog). No OpenAI config is used for the reply.
+- **`GENERATION_BACKEND=openai`**: the worker does RAG retrieval (NVIDIA + Milvus) and sends the augmented messages to **`OPENAI_BASE_URL`** with **`OPENAI_MODEL`** to produce the reply. That can be your usual OpenAI-compatible endpoint (same one you use in OWUI) or a different one.
+
+**To use “your” OpenAI model for RAG replies:** set the worker env to the same API and model you use in Open WebUI, for example:
+
+```bash
+GENERATION_BACKEND=openai
+OPENAI_BASE_URL=https://api.openai.com/v1   # or your proxy/OWUI URL if the model is exposed there
+OPENAI_MODEL=gpt-4o
+OPENAI_API_KEY=sk-...
+```
+
+**Model id:** Use the **exact** value the API expects. For Open WebUI’s API use the id shown in the UI (e.g. `openai/gpt-oss-120b`); for vLLM/direct backends use the raw model name (e.g. `gpt-oss-120b`).
+
+If your model is only available through Open WebUI (e.g. you added it in Admin → Connections), use Open WebUI’s API URL and the model id Open WebUI uses (e.g. `OPENAI_BASE_URL=http://open-webui:8080/v1` and `OPENAI_MODEL=openai/gpt-oss-120b` (use the exact model id the endpoint expects: with prefix for Open WebUI API, raw name for vLLM/direct)), and ensure the worker can reach that URL on the Docker network.
+
 ## Connect Pipelines to Open WebUI
 In Open WebUI (Admin → Pipelines):
 - Add pipeline URL: `http://pipelines:9099`
@@ -203,6 +224,9 @@ If your OWUI version supports listing knowledge bases at `GET /api/v1/knowledge`
   Usually the same cause as above: the runtime wasn’t awaiting `pipe()`. With the sync wrapper, slash commands should return immediately. Send the command as the only content in the message (e.g. type `/library off` and send).
 - **Pipeline keeps re-ingesting or “retrieving” the same document**  
   If the chat request still includes the same attachments on every turn, the pipeline will ingest again each time. Send a message *without* new attachments for plain chat or slash commands (e.g. `/library off`, `/help`, or a question). Clear or don’t re-attach the file for the next message.
+- **Blank or empty reply when querying a collection**  
+  The pipeline does **not** use the model you select elsewhere in Open WebUI (e.g. your OpenAI model). It calls the **NVIDIA RAG worker** for generation. So: (1) If you want the same OpenAI model for RAG, set the **worker** env: `GENERATION_BACKEND=openai`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, and `OPENAI_API_KEY` (see [Pipeline vs. “your OpenAI model”](#pipeline-vs-your-openai-model-in-open-webui)). (2) If the worker uses the NVIDIA backend, ensure the NVIDIA RAG SDK can reach its generation endpoint (e.g. API catalog). (3) To see what the worker is actually streaming, use the pipeline debug log (file-only, no network — see **Airgapped / offline** below).
+- **Airgapped / offline:** Pipeline debug logging writes only to a file (no external server). The pipelines service uses the writable mount `./pipeline_debug:/app/pipeline_debug` (see `docker-compose.yaml`). After reproducing the issue, the log is at **`pipeline_debug/debug.log`** in the project directory. Open that file and copy-paste its contents to share. Each line is one NDJSON record (timestamp, message, data, hypothesisId).
 - **Streaming response not showing in UI (logs show completion)**  
   The pipeline yields SSE event lines in the format the Open WebUI Pipelines server expects (`data: {...}` per line; the server adds `\n\n`). Chunk payloads include `logprobs` and match the OpenAI-style `chat.completion.chunk` shape. If the UI still doesn't update, check that the OpenAI API URL in Open WebUI points at the Pipelines service and that no proxy is buffering or altering the stream.
 - **Log shows `stream:true:<generator object Pipeline._pipe_async...>`**  

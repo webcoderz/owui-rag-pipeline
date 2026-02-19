@@ -62,6 +62,8 @@ services:
       # Some Pipelines builds copy/import pipelines from a per-pipeline subfolder (created at startup).
       # Mount into both locations so updates always apply.
       - ./docker/pipelines/nvidia_ingest_bridge_pipe.py:/app/pipelines/nvidia_ingest_bridge_pipe/nvidia_ingest_bridge_pipe.py:ro
+      # Writable debug log (file-only, no network): log at pipeline_debug/debug.log; copy file contents to share
+      - ./pipeline_debug:/app/pipeline_debug
 
     depends_on:
       - owui-postgres

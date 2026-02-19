@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
@@ -24,6 +25,24 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+# #region agent log
+def _debug_log(message: str, data: Optional[dict] = None, hypothesis_id: Optional[str] = None, run_id: Optional[str] = None):
+    """Append one NDJSON line to a local file only (no network). Airgapped-safe; copy pipeline_debug/debug.log to share."""
+    try:
+        path = os.getenv("DEBUG_LOG_PATH") or str(Path(__file__).resolve().parent.parent / "pipeline_debug" / "debug.log")
+        payload = {"timestamp": int(time.time() * 1000), "location": "nvidia_ingest_bridge_pipe", "message": message}
+        if data is not None:
+            payload["data"] = data
+        if hypothesis_id is not None:
+            payload["hypothesisId"] = hypothesis_id
+        if run_id is not None:
+            payload["runId"] = run_id
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 
 def _now() -> int:
@@ -1504,15 +1523,32 @@ class Pipeline:
                     ow_client, final_collections, user_key, user_token
                 )
                 final_collections = await self._filter_to_existing_collections(worker_client, final_collections)
+                # #region agent log
+                worker_line_count = 0
+                first_worker_yield_logged = False
+                # #endregion
                 async for line in self._stream_worker_generate(worker_client, messages, final_collections):
                     while not status_q.empty():
                         yield await status_q.get()
                     line = line.strip()
                     if not line:
                         continue
+                    # #region agent log
+                    worker_line_count += 1
+                    if worker_line_count <= 5:
+                        _debug_log("worker_raw_line", {"line_num": worker_line_count, "preview": (line[:400] + "..." if len(line) > 400 else line)}, hypothesis_id="A")
+                    # #endregion
                     parsed = _parse_worker_sse_line(model_id, line)
                     if parsed is not None:
+                        # #region agent log
+                        if not first_worker_yield_logged and parsed != _sse_done(model_id):
+                            first_worker_yield_logged = True
+                            _debug_log("first_worker_parsed_yield", {"preview": (parsed[:200] + "..." if len(parsed) > 200 else parsed)}, hypothesis_id="B")
+                        # #endregion
                         yield parsed
+                # #region agent log
+                _debug_log("worker_stream_end", {"total_lines": worker_line_count}, hypothesis_id="C")
+                # #endregion
 
                 while not status_q.empty():
                     yield await status_q.get()
@@ -1539,6 +1575,10 @@ class Pipeline:
             except Exception as e:
                 logger.exception("Non-stream runner collection failed")
                 content_parts.append(f"❌ Error: {e}\n")
+            # #region agent log
+            joined = "".join(content_parts).strip()
+            _debug_log("stream_false_content", {"num_parts": len(content_parts), "total_len": len(joined), "preview": (joined[:300] + "..." if len(joined) > 300 else joined)}, hypothesis_id="D", run_id="nonstream")
+            # #endregion
             return _json_completion(
                 model_id,
                 "".join(content_parts).strip() or "No response generated. Try again with streaming enabled, or check worker logs.",
