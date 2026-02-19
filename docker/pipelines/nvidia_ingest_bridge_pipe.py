@@ -202,7 +202,7 @@ class Pipeline:
 
     def _sanitize_collection_name(self, name: str) -> str:
         """
-        Best-effort collection name sanitizer.
+        Best-effort collection name sanitizer (for user input / display).
         Allows: letters, digits, '-', '_', '.', ':'.
         Also replaces whitespace with '-'.
         """
@@ -213,6 +213,27 @@ class Pipeline:
         allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:")
         s = "".join(ch for ch in s if ch in allowed)
         return s
+
+    def _to_milvus_safe_collection_name(self, name: str) -> str:
+        """
+        Convert a collection name to Milvus-valid form.
+        Milvus allows only letters, digits, underscore; must start with letter or underscore.
+        We replace '-', '.', ':' with '_' and strip any other invalid chars.
+        """
+        if not (name or "").strip():
+            return ""
+        s = (name or "").strip()
+        out = []
+        for ch in s:
+            if ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_":
+                out.append(ch)
+            elif ch in "-.:":
+                out.append("_")
+            # else skip other chars
+        result = "".join(out).strip("_") or ""
+        if result and result[0].isdigit():
+            result = "_" + result
+        return result[:255] if result else ""
 
     def _looks_like_collection_token(self, token: str) -> bool:
         """
@@ -552,8 +573,9 @@ class Pipeline:
         filename: str,
         tmp_path: str,
     ) -> dict:
+        milvus_name = self._to_milvus_safe_collection_name(collection_name) or collection_name
         form = {
-            "collection_name": collection_name,
+            "collection_name": milvus_name,
             "vdb_endpoint": self.valves.VDB_ENDPOINT,
             "blocking": "true",
             "chunk_size": str(self.valves.CHUNK_SIZE),
@@ -572,9 +594,10 @@ class Pipeline:
         return r.json()
 
     async def _stream_worker_generate(self, client: httpx.AsyncClient, messages: List[dict], collection_names: List[str]):
+        milvus_names = [self._to_milvus_safe_collection_name(c) or c for c in collection_names]
         payload = {
             "messages": messages,
-            "collection_names": collection_names,
+            "collection_names": milvus_names,
             "use_knowledge_base": bool(collection_names),
             "vdb_endpoint": self.valves.VDB_ENDPOINT,
         }
@@ -600,10 +623,11 @@ class Pipeline:
           DELETE /v1/documents?collection_name=...&vdb_endpoint=...
           body: ["doc1.pdf", "doc2.pdf"]
         """
+        milvus_name = self._to_milvus_safe_collection_name(collection_name) or collection_name
         r = await client.request(
             "DELETE",
             f"{self.valves.NVIDIA_WORKER_URL}/v1/documents",
-            params={"collection_name": collection_name, "vdb_endpoint": self.valves.VDB_ENDPOINT},
+            params={"collection_name": milvus_name, "vdb_endpoint": self.valves.VDB_ENDPOINT},
             json=document_names,
             timeout=self.valves.OWUI_JSON_TIMEOUT_S,
         )
