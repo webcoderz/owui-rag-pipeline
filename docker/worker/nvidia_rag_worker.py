@@ -77,29 +77,35 @@ async def _maybe_await(value):
     return value
 
 
+def _benign_milvus_filter(record: logging.LogRecord) -> bool:
+    """Return False to suppress known-benign Milvus/SDK warnings (empty metadata_schema/document_info)."""
+    msg = (record.getMessage() or "")
+    if "no entities found" not in msg.lower():
+        return True
+    if "metadata_scheme" in msg or "metadata_schema" in msg or "document_info" in msg:
+        return False
+    return True
+
+
 @contextmanager
 def _suppress_benign_milvus_warnings():
-    """
-    Suppress known-benign Milvus/SDK warnings during collection listing.
-    The NVIDIA RAG SDK may query internal collections (metadata_scheme, document_info)
-    that are empty when no catalog-style data is ingested; those warnings are harmless.
-    """
-    class _Filter(logging.Filter):
-        def filter(self, record: logging.LogRecord) -> bool:
-            msg = (record.getMessage() or "")
-            if "no entities found" not in msg.lower():
-                return True
-            if "metadata_scheme" in msg or "document_info" in msg:
-                return False
-            return True
-
-    filt = _Filter()
+    """Context manager: suppress benign Milvus warnings for the duration of a call (e.g. list_collections)."""
+    filt = logging.Filter()
+    filt.filter = _benign_milvus_filter  # type: ignore[method-assign]
     root = logging.getLogger()
     root.addFilter(filt)
     try:
         yield
     finally:
         root.removeFilter(filt)
+
+
+# Install filter on SDK loggers so benign Milvus warnings are suppressed for all operations (generate, ingest, list).
+for _logger_name in ("nvidia_rag.utils.vdb.milvus.milvus_vdb", "nvidia_rag.utils.vdb.milvus", "nvidia_rag"):
+    _log = logging.getLogger(_logger_name)
+    _f = logging.Filter()
+    _f.filter = _benign_milvus_filter  # type: ignore[method-assign]
+    _log.addFilter(_f)
 
 
 async def _call_ingestor_first(method_names: List[str], **kwargs):

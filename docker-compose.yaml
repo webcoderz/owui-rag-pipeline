@@ -13,7 +13,7 @@ services:
       HTTPS_PROXY: ${HTTPS_PROXY}
       http_proxy: ${HTTP_PROXY}
       https_proxy: ${HTTPS_PROXY}
-
+      no_proxy: localhost,127.0.0.1,open-webui,pipelines,nvidia-rag-worker,owui-postgres,milvus
       # Required for NVIDIA RAG ingestion server internals (MinIO is used at import/startup time)
       # IMPORTANT: Do NOT use localhost here inside Docker. Use a resolvable hostname on the Docker network.
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9010}

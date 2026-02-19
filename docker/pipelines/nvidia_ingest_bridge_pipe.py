@@ -965,13 +965,33 @@ class Pipeline:
             "Commands:\n"
             "- /collection list — show this chat’s known/remembered collections\n"
             "- /forget — clear this chat's remembered collections (next message won't use RAG until you attach again)\n"
-            "- /library on — save future ingests to your library\n"
+                    "- /library on — save future ingests to your library\n"
             "- /library off — do not save future ingests to your library\n"
             "- /library — show this chat's current save-to-library setting\n"
             "- /ingest [collection] — ingest attachments/KBs and stop (optional target collection)\n"
             "- /query [collection] <question> — query remembered collections, or a specific collection\n"
             "- /delete <collection> <filename> — delete a document from a collection\n"
-            "- /commands — show this help\n"
+            "- /delete chat <filename> / /delete library <filename> — shorthand for derived collections\n"
+            "- /commands or /help — show this help\n"
+        )
+        # Full README-aligned list (also used for non-stream /commands below)
+        _commands_full = (
+            "Commands:\n"
+            "- /commands or /help — show this help\n"
+            "- /collection list — show this chat's known/remembered collections + derived chat/library names\n"
+            "- /forget — clear this chat's remembered collections; next message won't use RAG until you attach again or use /query <collection>\n"
+            "- /library — show this chat's current save-to-library setting\n"
+            "- /library on — future ingests in this chat also save to your per-user library\n"
+            "- /library off — do not save future ingests to your library\n"
+            "- /ingest — ingest currently attached files / selected Knowledge Bases and stop (no response)\n"
+            "- /ingest <collection> — same, but ingest into a specific target collection (and remember it)\n"
+            "- /ingest chat — shorthand: ingest into this chat's derived uploads collection\n"
+            "- /ingest library — shorthand: ingest into your derived library collection\n"
+            "- /query <question> — ask using this chat's remembered collections (and library if enabled)\n"
+            "- /query <collection> <question> — ask using a specific collection only\n"
+            "- /query chat <question> / /query library <question> — shorthand for derived collections\n"
+            "- /delete <collection> <filename> — delete a document from a collection (worker DELETE /v1/documents)\n"
+            "- /delete chat <filename> / /delete library <filename> — shorthand for derived collections\n"
         )
 
         # For slash-commands, match the response type to the request:
@@ -983,10 +1003,10 @@ class Pipeline:
                     if (os.getenv("PIPE_DEBUG", "").lower() in ("1", "true", "yes")):
                         logger.warning("cmd_stream: start")
                     yield _sse_chunk(model_id, role="assistant")
-                    yield _sse_chunk(model_id, commands_text)
+                    yield _sse_chunk(model_id, _commands_full)
                     yield _sse_done(model_id)
                 return _sync_stream_from_async(cmd_stream())
-            return _json_completion(model_id, commands_text)
+            return _json_completion(model_id, _commands_full)
 
         # /collection list: show known collections for this chat/user
         if text in ("/collection list", "/collections", "/collections list"):
@@ -1498,19 +1518,7 @@ class Pipeline:
         # Returning a Starlette/FastAPI Response object here can be ignored by the Pipelines runtime.
         if not stream:
             if text in ("/commands", "/help", "/?"):
-                return _json_completion(
-                    model_id,
-                    "Commands:\n"
-                    "- /collection list — show this chat’s known/remembered collections\n"
-                    "- /forget — clear this chat's remembered collections (next message won't use RAG until you attach again)\n"
-            "- /library on — save future ingests to your library\n"
-                    "- /library off — do not save future ingests to your library\n"
-                    "- /library — show this chat's current save-to-library setting\n"
-                    "- /ingest [collection] — ingest attachments/KBs and stop (optional target collection)\n"
-                    "- /query [collection] <question> — query remembered collections, or a specific collection\n"
-                    "- /delete <collection> <filename> — delete a document from a collection\n"
-                    "- /commands — show this help\n",
-                )
+                return _json_completion(model_id, _commands_full)
             if text.startswith("/"):
                 return _json_completion(model_id, f"Unknown command: {text}. Try /commands.")
             # Non-stream request (e.g. follow-up suggestions or client sent stream=false):
