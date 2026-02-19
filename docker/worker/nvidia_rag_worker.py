@@ -39,6 +39,12 @@ _set_default_env("NVINGEST_MINIO_BUCKET", os.getenv("MINIO_BUCKET", "nv-ingest")
 _set_default_env("VDB_ENDPOINT", "http://milvus:19530")
 # NVIDIA RAG Blueprint uses APP_VECTORSTORE_URL for Milvus; set from VDB_ENDPOINT so SDK sees it at init.
 _set_default_env("APP_VECTORSTORE_URL", os.getenv("VDB_ENDPOINT", "http://milvus:19530"))
+# If HTTP_PROXY is set, ensure outbound generation requests bypass it (SDK and requests read this at runtime).
+# Default to * so SDK/requests never use proxy unless caller explicitly sets NO_PROXY to something else.
+if os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY"):
+    if not os.getenv("NO_PROXY") and not os.getenv("no_proxy"):
+        os.environ["NO_PROXY"] = "*"
+        os.environ["no_proxy"] = "*"
 
 # NVIDIA client SDK (py3.12+)
 from nvidia_rag import NvidiaRAG, NvidiaRAGIngestor
@@ -251,7 +257,8 @@ def _stream_openai_chat_completions(
     endpoint = f"{url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key or 'dummy'}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "stream": True}
-    with requests.post(endpoint, headers=headers, json=payload, stream=True, timeout=600) as r:
+    # Bypass HTTP_PROXY so generation request is not sent via proxy (avoids HTML block pages)
+    with requests.post(endpoint, headers=headers, json=payload, stream=True, timeout=600, proxies={"http": None, "https": None}) as r:
         r.raise_for_status()
         for line in r.iter_lines(decode_unicode=True):
             if not line:
@@ -291,7 +298,7 @@ def ready():
 
         try:
             url = _openai_models_url(base_url)
-            r = requests.get(url, headers=_openai_headers(api_key), timeout=5)
+            r = requests.get(url, headers=_openai_headers(api_key), timeout=5, proxies={"http": None, "https": None})
             status["openai_models_status_code"] = r.status_code
         except Exception as e:
             return JSONResponse(
