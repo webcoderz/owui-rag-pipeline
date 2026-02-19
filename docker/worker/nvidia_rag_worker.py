@@ -382,22 +382,27 @@ async def generate(payload: Dict[str, Any]):
       {
         "messages":[...],
         "collection_names":["..."],
-        "use_knowledge_base":true
+        "use_knowledge_base":true,
+        "vdb_endpoint":"http://milvus:19530"  (optional; else VDB_ENDPOINT env or default)
       }
     """
     messages = payload.get("messages") or []
     collection_names = payload.get("collection_names") or []
     use_knowledge_base = bool(payload.get("use_knowledge_base", bool(collection_names)))
+    vdb_endpoint = (payload.get("vdb_endpoint") or os.getenv("VDB_ENDPOINT") or "http://milvus:19530").strip()
 
     generation_backend = (os.getenv("GENERATION_BACKEND") or "nvidia").strip().lower()
 
     # Backend A: use NVIDIA RAG SDK generation (defaults to NVIDIA model stack)
     if generation_backend in ("nvidia", "nvidia_rag", "sdk"):
-        rag_resp = rag.generate(
-            messages=messages,
-            use_knowledge_base=use_knowledge_base,
-            collection_names=collection_names,
-        )
+        gen_kwargs: Dict[str, Any] = {
+            "messages": messages,
+            "use_knowledge_base": use_knowledge_base,
+            "collection_names": collection_names,
+            "vdb_endpoint": vdb_endpoint,
+        }
+        gen_kwargs = _filter_kwargs_for_callable(rag.generate, gen_kwargs)
+        rag_resp = rag.generate(**gen_kwargs)
 
         if getattr(rag_resp, "status_code", 200) != 200:
             return JSONResponse(
@@ -424,7 +429,9 @@ async def generate(payload: Dict[str, Any]):
             try:
                 query = _get_last_user_text(messages)
                 if query:
-                    citations = rag.search(query=query, collection_names=collection_names)
+                    search_kwargs = {"query": query, "collection_names": collection_names, "vdb_endpoint": vdb_endpoint}
+                    search_kwargs = _filter_kwargs_for_callable(rag.search, search_kwargs)
+                    citations = rag.search(**search_kwargs)
                     context_text = _extract_search_results_text(citations)
             except Exception:
                 context_text = ""

@@ -576,6 +576,7 @@ class Pipeline:
             "messages": messages,
             "collection_names": collection_names,
             "use_knowledge_base": bool(collection_names),
+            "vdb_endpoint": self.valves.VDB_ENDPOINT,
         }
         async with client.stream(
             "POST",
