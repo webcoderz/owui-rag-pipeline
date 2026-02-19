@@ -25,9 +25,14 @@ def _set_default_env(name: str, default: str) -> None:
         os.environ[name] = default
 
 # Docker-friendly defaults (avoid localhost inside containers).
+# SDK requires MINIO_BUCKET for "retrieve collections" / ingest. Keep in sync with NVINGEST_MINIO_BUCKET.
 _set_default_env("MINIO_ENDPOINT", "minio:9010")
 _set_default_env("MINIO_ACCESSKEY", "minioadmin")
 _set_default_env("MINIO_SECRETKEY", "minioadmin")
+if not os.getenv("MINIO_BUCKET") and os.getenv("NVINGEST_MINIO_BUCKET"):
+    os.environ["MINIO_BUCKET"] = os.environ["NVINGEST_MINIO_BUCKET"]
+_set_default_env("MINIO_BUCKET", "nv-ingest")
+_set_default_env("NVINGEST_MINIO_BUCKET", os.getenv("MINIO_BUCKET", "nv-ingest"))
 _set_default_env("VDB_ENDPOINT", "http://milvus:19530")
 # NVIDIA RAG Blueprint uses APP_VECTORSTORE_URL for Milvus; set from VDB_ENDPOINT so SDK sees it at init.
 _set_default_env("APP_VECTORSTORE_URL", os.getenv("VDB_ENDPOINT", "http://milvus:19530"))
@@ -451,7 +456,7 @@ async def generate(payload: Dict[str, Any]):
             "vdb_endpoint": vdb_endpoint,
         }
         gen_kwargs = _filter_kwargs_for_callable(rag.generate, gen_kwargs)
-        rag_resp = rag.generate(**gen_kwargs)
+        rag_resp = await _maybe_await(rag.generate(**gen_kwargs))
 
         if getattr(rag_resp, "status_code", 200) != 200:
             return JSONResponse(
@@ -480,7 +485,7 @@ async def generate(payload: Dict[str, Any]):
                 if query:
                     search_kwargs = {"query": query, "collection_names": collection_names, "vdb_endpoint": vdb_endpoint}
                     search_kwargs = _filter_kwargs_for_callable(rag.search, search_kwargs)
-                    citations = rag.search(**search_kwargs)
+                    citations = await _maybe_await(rag.search(**search_kwargs))
                     context_text = _extract_search_results_text(citations)
             except Exception:
                 context_text = ""

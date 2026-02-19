@@ -19,8 +19,9 @@ services:
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9010}
       MINIO_ACCESSKEY: ${MINIO_ACCESSKEY:-minioadmin}
       MINIO_SECRETKEY: ${MINIO_SECRETKEY:-minioadmin}
-      # Optional bucket name used by nv-ingest integrations (defaults inside the SDK if unset)
-      NVINGEST_MINIO_BUCKET: ${NVINGEST_MINIO_BUCKET}
+      # SDK requires MINIO_BUCKET for retrieve collections / ingest (use a bucket that exists in MinIO)
+      MINIO_BUCKET: ${MINIO_BUCKET:-nv-ingest}
+      NVINGEST_MINIO_BUCKET: ${NVINGEST_MINIO_BUCKET:-nv-ingest}
 
       # Milvus / vector DB (required for RAG generate and search). Do NOT use localhost inside Docker.
       VDB_ENDPOINT: ${VDB_ENDPOINT:-http://milvus:19530}

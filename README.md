@@ -187,6 +187,11 @@ If your OWUI version supports listing knowledge bases at `GET /api/v1/knowledge`
 - Collection names and Milvus-safe conversion match the pipeline; the script does not create extra or “false” collections—each KB maps to one collection name.
 
 ## Troubleshooting
+- **Code changes not taking effect / "create the collection first" / collection doesn't exist**
+  - **Worker:** The worker image **bakes in** `nvidia_rag_worker.py` at build time. `docker compose up --force-recreate` does **not** rebuild the image, so you still run old code. To pick up worker changes:  
+    `docker compose build nvidia-rag-worker --no-cache && docker compose up -d nvidia-rag-worker`
+  - **Pipeline:** The pipeline script is **mounted** from the host, but the Pipelines server **caches** the Python module in memory after first import. Restart the container so it reloads the file:  
+    `docker compose restart pipelines`
 - **"coroutine Pipeline.pipe was never awaited"**  
   The pipeline exposes a synchronous `pipe()` so Open WebUI can call it without `await`. If you still see this, ensure you’re on the latest pipeline image and that the Pipelines service has been restarted after an update.
 - **/commands, /help, or /library off does nothing**  
@@ -208,7 +213,7 @@ If your OWUI version supports listing knowledge bases at `GET /api/v1/knowledge`
   - Verify it’s reachable at `VDB_ENDPOINT` and the collection prefix has permissions to create collections
 
 ## Production checklist (high-signal)
-- **MinIO**: `MINIO_ENDPOINT` must be a Docker-reachable hostname (never `localhost` inside containers).
+- **MinIO**: `MINIO_ENDPOINT` must be a Docker-reachable hostname (never `localhost` inside containers). The SDK requires **`MINIO_BUCKET`** for “retrieve collections” and ingest; set it to a bucket that exists in MinIO (e.g. `nv-ingest`, or `default-bucket` / `a-bucket` if that’s what you have). Create the bucket in MinIO if needed.
 - **Generation backend**:
   - If using vLLM/OpenAI: set `GENERATION_BACKEND=openai`, plus `OPENAI_BASE_URL` + `OPENAI_MODEL`.
   - Validate with `curl http://localhost:8123/ready` (should return `status: ok`).
