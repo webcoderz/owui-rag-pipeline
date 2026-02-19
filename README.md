@@ -16,6 +16,18 @@ This repo wires Open WebUI Pipelines to an NVIDIA RAG worker (Python SDK) and a 
   - Tracks ingest status in Postgres
   - Supports per-user library and chat allowlist
 
+### Access control (OWUI–Milvus linking)
+
+Collections are scoped so Milvus usage respects Open WebUI permissions:
+
+| Collection pattern | OWUI concept | Access rule |
+|-------------------|---------------|-------------|
+| `owui-u-{user}-library` | User's library | Only that user |
+| `owui-u-{user}-chat-{id}` / `owui-chat-{id}` | Chat uploads | User-scoped or global (see `USER_SCOPED_CHAT_COLLECTIONS`) |
+| `owui-kb-public-{id}` / `owui-kb-{id}` | Knowledge base | OWUI KB permissions (user/group); checked via `GET /api/v1/knowledge/{id}` |
+
+When the pipeline receives the requesting user's Bearer token (e.g. from `__request__`), it uses that token for OWUI API calls (files, knowledge). That way Open WebUI enforces access and we only query/ingest collections the user is allowed to see. If only a service key is used, KB access is not user-scoped.
+
 ## Prerequisites
 - Docker and Docker Compose
 - External services reachable from this compose:

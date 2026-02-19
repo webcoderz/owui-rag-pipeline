@@ -334,8 +334,16 @@ class Pipeline:
         return user_key.replace("@", "_").replace(":", "_").replace("/", "_")
 
     # -----------------------
-    # Collection names
+    # Collection names (OWUI–Milvus linking and access)
     # -----------------------
+    #
+    # Collections are scoped so Milvus access aligns with Open WebUI access:
+    # - owui-u-{user}-library  → user's personal library (only that user)
+    # - owui-u-{user}-chat-{id} / owui-chat-{id}  → chat uploads (user-scoped or global)
+    # - owui-kb-public-{kb_id} / owui-kb-{kb_id}  → OWUI knowledge base (access via OWUI KB permissions)
+    # We use __request__'s Bearer token for OWUI API calls when present so OWUI enforces user/group
+    # access; before query we filter collections by _filter_collections_by_owui_access (library/chat
+    # must belong to current user, KB must be accessible via GET /api/v1/knowledge/{id}).
 
     def _kb_collection_name(self, kb_id: str, kb_meta: dict) -> str:
         is_public = kb_meta.get("is_public")
@@ -353,6 +361,33 @@ class Pipeline:
     def _library_collection_name(self, user_key: str) -> str:
         safe = self._safe_user_key(user_key)
         return f"{self.valves.COLLECTION_PREFIX}-u-{safe}-library"
+
+    def _parse_collection_name(self, name: str) -> Tuple[str, Any]:
+        """
+        Parse our collection name into type and payload for access checks.
+        Returns (type, payload): type in ('library','chat','kb'), payload is type-specific.
+        - library: payload = user_key (safe segment)
+        - chat: payload = user_key or None (None if not user-scoped)
+        - kb: payload = kb_id
+        """
+        if not name or not name.startswith(self.valves.COLLECTION_PREFIX):
+            return ("unknown", None)
+        rest = name[len(self.valves.COLLECTION_PREFIX) :].lstrip("-")
+        if rest.startswith("u-") and rest.endswith("-library"):
+            # owui-u-{safe}-library
+            segment = rest[2 : -len("-library")].strip()
+            return ("library", segment)
+        if rest.startswith("u-") and "-chat-" in rest:
+            # owui-u-{safe}-chat-{chat_id}
+            segment = rest[2:].split("-chat-", 1)[0]
+            return ("chat", segment)
+        if rest.startswith("chat-"):
+            return ("chat", None)
+        if rest.startswith("kb-public-"):
+            return ("kb", rest[len("kb-public-") :].strip())
+        if rest.startswith("kb-"):
+            return ("kb", rest[len("kb-") :].strip())
+        return ("unknown", None)
 
     # -----------------------
     # Allowlist + library settings
@@ -479,13 +514,18 @@ class Pipeline:
     # OWUI API helpers
     # -----------------------
 
-    def _ow_headers(self) -> Dict[str, str]:
-        return {"Authorization": f"Bearer {self.valves.OPENWEBUI_API_KEY}"} if self.valves.OPENWEBUI_API_KEY else {}
+    def _ow_headers(self, user_token: Optional[str] = None) -> Dict[str, str]:
+        """Use user's Bearer token when provided (for OWUI access control); else service key."""
+        if user_token and user_token.strip():
+            return {"Authorization": user_token.strip()}
+        if self.valves.OPENWEBUI_API_KEY:
+            return {"Authorization": f"Bearer {self.valves.OPENWEBUI_API_KEY}"}
+        return {}
 
-    async def _ow_get_json(self, client: httpx.AsyncClient, path: str) -> dict:
+    async def _ow_get_json(self, client: httpx.AsyncClient, path: str, user_token: Optional[str] = None) -> dict:
         r = await client.get(
             f"{self.valves.OPENWEBUI_BASE_URL}{path}",
-            headers=self._ow_headers(),
+            headers=self._ow_headers(user_token),
             timeout=self.valves.OWUI_JSON_TIMEOUT_S
         )
         r.raise_for_status()
@@ -498,6 +538,7 @@ class Pipeline:
         filename: str,
         emit,
         model_id: str,
+        user_token: Optional[str] = None,
     ) -> Tuple[str, str, int]:
         """
         Streams OWUI file content to a temp file to avoid RAM spikes.
@@ -515,7 +556,7 @@ class Pipeline:
         async with client.stream(
             "GET",
             url,
-            headers=self._ow_headers(),
+            headers=self._ow_headers(user_token),
             params={"attachment": "false"},
             timeout=self.valves.OWUI_STREAM_TIMEOUT_S
         ) as r:
@@ -593,6 +634,78 @@ class Pipeline:
         r.raise_for_status()
         return r.json()
 
+    async def _worker_get_existing_collections(self, client: httpx.AsyncClient) -> set:
+        """Return set of Milvus collection names that exist (Milvus-safe names as in the DB)."""
+        try:
+            r = await client.get(
+                f"{self.valves.NVIDIA_WORKER_URL}/collections",
+                params={"vdb_endpoint": self.valves.VDB_ENDPOINT},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+            names = data.get("collections") or []
+            return set(n for n in names if n)
+        except Exception:
+            return set()
+
+    async def _filter_to_existing_collections(
+        self, client: httpx.AsyncClient, collection_names: List[str]
+    ) -> List[str]:
+        """Keep only collection names that exist in Milvus to avoid 'collection does not exist'."""
+        if not collection_names:
+            return collection_names
+        existing = await self._worker_get_existing_collections(client)
+        if not existing:
+            return collection_names
+        out = []
+        for c in collection_names:
+            milvus_name = self._to_milvus_safe_collection_name(c) or c
+            if milvus_name in existing:
+                out.append(c)
+        return out
+
+    async def _filter_collections_by_owui_access(
+        self,
+        ow_client: httpx.AsyncClient,
+        collection_names: List[str],
+        user_key: str,
+        user_token: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Keep only collections the current user is allowed to use (OWUI–Milvus access alignment).
+        - Library/chat: allow only if they belong to this user (user_key).
+        - KB: allow only if GET /api/v1/knowledge/{kb_id} succeeds (OWUI enforces user/group access).
+        """
+        if not collection_names:
+            return collection_names
+        safe_user = self._safe_user_key(user_key)
+        out = []
+        for name in collection_names:
+            ctype, payload = self._parse_collection_name(name)
+            if ctype == "library":
+                if payload == safe_user:
+                    out.append(name)
+                # else: different user's library, drop
+                continue
+            if ctype == "chat":
+                if payload is None:
+                    out.append(name)
+                elif payload == safe_user:
+                    out.append(name)
+                continue
+            if ctype == "kb" and payload:
+                try:
+                    await self._ow_get_json(ow_client, f"/api/v1/knowledge/{payload}", user_token=user_token)
+                    out.append(name)
+                except Exception:
+                    # 403/404 or network: user has no access or KB gone
+                    continue
+                continue
+            # unknown or no payload: allow (e.g. custom names); or drop for safety — allow to avoid breaking
+            out.append(name)
+        return out
+
     async def _stream_worker_generate(self, client: httpx.AsyncClient, messages: List[dict], collection_names: List[str]):
         milvus_names = [self._to_milvus_safe_collection_name(c) or c for c in collection_names]
         payload = {
@@ -646,6 +759,7 @@ class Pipeline:
         collection_name: str,
         emit,
         model_id: str,
+        user_token: Optional[str] = None,
     ) -> None:
         sem = asyncio.Semaphore(self.valves.MAX_PARALLEL_FILE_INGEST)
         total = len(entries)
@@ -661,7 +775,7 @@ class Pipeline:
                 sha = None
                 try:
                     tmp_path, sha, _ = await self._download_to_tempfile_and_hash(
-                        ow_client, file_id, filename, emit, model_id
+                        ow_client, file_id, filename, emit, model_id, user_token=user_token
                     )
 
                     st = await self._manifest_get_status(file_id, collection_name, sha)
@@ -719,19 +833,21 @@ class Pipeline:
         self,
         body: dict,
         __user__: Optional[dict] = None,
+        __request__: Optional[Any] = None,
         user_message: Optional[str] = None,
         **kwargs,
     ):
+        req = __request__ if __request__ is not None else kwargs.get("__request__")
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
         if loop is None:
-            return asyncio.run(self._pipe_async(body, __user__=__user__, user_message=user_message, **kwargs))
+            return asyncio.run(self._pipe_async(body, __user__=__user__, __request__=req, user_message=user_message, **kwargs))
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             future = ex.submit(
                 asyncio.run,
-                self._pipe_async(body, __user__=__user__, user_message=user_message, **kwargs),
+                self._pipe_async(body, __user__=__user__, __request__=req, user_message=user_message, **kwargs),
             )
             return future.result()
 
@@ -739,12 +855,17 @@ class Pipeline:
         self,
         body: dict,
         __user__: Optional[dict] = None,
+        __request__: Optional[Any] = None,
         # Open WebUI Pipelines may pass extra kwargs depending on version.
         user_message: Optional[str] = None,
         **kwargs,
     ):
         user = __user__ or {}
         user_key = self._user_key(user)
+        # Use requesting user's Bearer token for OWUI API when present (enforces KB/user access).
+        user_token: Optional[str] = None
+        if __request__ is not None and getattr(__request__, "headers", None):
+            user_token = (__request__.headers.get("Authorization") or "").strip() or None
         model_id = body.get("model") or "nvidia-rag-auto-ingest"
 
         chat_id = body.get("chat_id") or body.get("conversation_id") or body.get("id") or str(_now())
@@ -945,7 +1066,7 @@ class Pipeline:
 
                         # KB files
                         for kb_id in kb_ids:
-                            kb_meta = await self._ow_get_json(ow_client, f"/api/v1/knowledge/{kb_id}")
+                            kb_meta = await self._ow_get_json(ow_client, f"/api/v1/knowledge/{kb_id}", user_token=user_token)
                             kb_collection = target_collection or self._kb_collection_name(kb_id, kb_meta)
                             await emit(f"📚 Knowledge `{kb_id}` → `{kb_collection}`\n")
 
@@ -960,7 +1081,7 @@ class Pipeline:
                             await emit(f"📥 KB files: {len(entries)}\n")
 
                             await self._ingest_entries_into_collection(
-                                ow_client, worker_client, entries, kb_collection, emit, model_id
+                                ow_client, worker_client, entries, kb_collection, emit, model_id, user_token=user_token
                             )
                             newly_used.append(kb_collection)
 
@@ -970,12 +1091,12 @@ class Pipeline:
                             await emit(f"📥 Chat uploads → `{chat_collection}`\n")
                             entries2: List[Tuple[str, str]] = []
                             for fid in adhoc_file_ids:
-                                meta = await self._ow_get_json(ow_client, f"/api/v1/files/{fid}")
+                                meta = await self._ow_get_json(ow_client, f"/api/v1/files/{fid}", user_token=user_token)
                                 fname = meta.get("filename") or meta.get("name") or fid
                                 entries2.append((fid, fname))
                             await emit(f"📥 Uploads: {len(entries2)}\n")
                             await self._ingest_entries_into_collection(
-                                ow_client, worker_client, entries2, chat_collection, emit, model_id
+                                ow_client, worker_client, entries2, chat_collection, emit, model_id, user_token=user_token
                             )
                             newly_used.append(chat_collection)
 
@@ -1069,7 +1190,12 @@ class Pipeline:
                 else:
                     q_messages.append({"role": "user", "content": query})
 
+                async with httpx.AsyncClient() as ow_client:
+                    collection_names = await self._filter_collections_by_owui_access(
+                        ow_client, collection_names, user_key, user_token
+                    )
                 async with httpx.AsyncClient() as worker_client:
+                    collection_names = await self._filter_to_existing_collections(worker_client, collection_names)
                     async for line in self._stream_worker_generate(worker_client, q_messages, collection_names):
                         parsed = _parse_worker_sse_line(model_id, line)
                         if parsed is not None:
@@ -1204,7 +1330,7 @@ class Pipeline:
 
                     # Knowledge collections
                     for kb_id in kb_ids:
-                        kb_meta = await self._ow_get_json(ow_client, f"/api/v1/knowledge/{kb_id}")
+                        kb_meta = await self._ow_get_json(ow_client, f"/api/v1/knowledge/{kb_id}", user_token=user_token)
                         kb_collection = self._kb_collection_name(kb_id, kb_meta)
                         await emit(f"📚 Knowledge `{kb_id}` → `{kb_collection}`\n")
 
@@ -1219,14 +1345,14 @@ class Pipeline:
 
                         await emit(f"📥 KB files: {len(entries)}\n")
                         await self._ingest_entries_into_collection(
-                            ow_client, worker_client, entries, kb_collection, emit, model_id
+                            ow_client, worker_client, entries, kb_collection, emit, model_id, user_token=user_token
                         )
                         newly_used.append(kb_collection)
 
                         if save_to_library:
                             await emit(f"📚 Saving KB docs to your library → `{lib_collection}`\n")
                             await self._ingest_entries_into_collection(
-                                ow_client, worker_client, entries, lib_collection, emit, model_id
+                                ow_client, worker_client, entries, lib_collection, emit, model_id, user_token=user_token
                             )
 
                     # Ad-hoc uploads
@@ -1237,7 +1363,7 @@ class Pipeline:
                         entries: List[Tuple[str, str]] = []
                         for fid in adhoc_file_ids:
                             try:
-                                meta = await self._ow_get_json(ow_client, f"/api/v1/files/{fid}")
+                                meta = await self._ow_get_json(ow_client, f"/api/v1/files/{fid}", user_token=user_token)
                                 fname = meta.get("filename") or meta.get("name") or fid
                                 size = meta.get("size") or meta.get("file_size")
                                 if size and int(size) > self.valves.MAX_FILE_BYTES:
@@ -1249,14 +1375,14 @@ class Pipeline:
 
                         await emit(f"📥 Uploads: {len(entries)}\n")
                         await self._ingest_entries_into_collection(
-                            ow_client, worker_client, entries, chat_collection, emit, model_id
+                            ow_client, worker_client, entries, chat_collection, emit, model_id, user_token=user_token
                         )
                         newly_used.append(chat_collection)
 
                         if save_to_library:
                             await emit(f"📚 Saving uploads to your library → `{lib_collection}`\n")
                             await self._ingest_entries_into_collection(
-                                ow_client, worker_client, entries, lib_collection, emit, model_id
+                                ow_client, worker_client, entries, lib_collection, emit, model_id, user_token=user_token
                             )
 
                     await emit("✅ Ingestion complete.\n")
@@ -1274,6 +1400,10 @@ class Pipeline:
                     yield await status_q.get()
 
                 final_collections = list(dict.fromkeys(collection_names))
+                final_collections = await self._filter_collections_by_owui_access(
+                    ow_client, final_collections, user_key, user_token
+                )
+                final_collections = await self._filter_to_existing_collections(worker_client, final_collections)
                 async for line in self._stream_worker_generate(worker_client, messages, final_collections):
                     while not status_q.empty():
                         yield await status_q.get()

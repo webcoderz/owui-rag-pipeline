@@ -261,11 +261,11 @@ async def ingest(
     Ingest one document into a collection using NvidiaRAGIngestor.
     Accepts a single file (multipart upload). Pipelines calls this concurrently (bounded).
     """
-    # ensure collection exists (ignore "already exists" errors)
+    # Create collection if it doesn't exist; if it already exists we continue and ingest into it.
     try:
         ingestor.create_collection(collection_name=collection_name, vdb_endpoint=vdb_endpoint)
     except Exception:
-        pass
+        pass  # e.g. already exists — proceed to upload_documents into the existing collection
 
     # write to temp file because upload_documents expects filepaths
     tmp_path = None
@@ -300,6 +300,45 @@ async def ingest(
                 os.rmdir(tmp_dir)
             except Exception:
                 pass
+
+
+@app.get("/collections")
+async def list_collections(
+    vdb_endpoint: Optional[str] = Query(default=None),
+):
+    """
+    List collection names that exist in Milvus.
+    Used by the pipeline to avoid "collection does not exist" when querying
+    (e.g. library is included but never ingested).
+    """
+    vdb = (vdb_endpoint or os.getenv("VDB_ENDPOINT") or "http://milvus:19530").strip()
+    try:
+        result = await _call_ingestor_first(
+            ["get_collections", "list_collections"],
+            vdb_endpoint=vdb,
+        )
+        if result is None:
+            return JSONResponse({"collections": []})
+        if isinstance(result, list):
+            names = []
+            for x in result:
+                if isinstance(x, dict):
+                    names.append(str(x.get("name", x.get("collection_name", list(x.values())[0] if x else ""))))
+                else:
+                    names.append(str(x))
+        elif isinstance(result, dict):
+            names = result.get("collections", result.get("names", list(result.keys()) if result else []))
+            if not isinstance(names, list):
+                names = list(names) if names else []
+            names = [str(n) if not isinstance(n, dict) else str(n.get("name", n.get("collection_name", ""))) for n in names]
+        else:
+            names = []
+        return JSONResponse({"collections": names})
+    except Exception as e:
+        return JSONResponse(
+            {"collections": [], "error": str(e), "hint": "RAG search will skip collection filtering."},
+            status_code=200,
+        )
 
 
 @app.get("/v1/documents")
