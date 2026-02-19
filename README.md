@@ -156,6 +156,36 @@ Collection naming conventions (prefix defaults to `owui`):
 - Chat uploads: `owui-u-<user>-chat-<chat_id>` (user-scoped by default)
 - Library: `owui-u-<user>-library`
 
+## Backfilling existing OWUI knowledge into Milvus
+
+If you had knowledge bases in Open WebUI **before** integrating this pipeline, their documents live in OWUI but not in Milvus. Use the backfill script to ingest those into the same collection names the pipeline uses, so RAG queries can search that content.
+
+**Safety and idempotency:**
+- **--confirm** is required for real ingest (without `--dry-run`). Avoids accidental runs.
+- **Skip existing:** By default the script asks the worker which documents are already in each collection and skips those, so you can run it multiple times without duplicating documents.
+- **Preflight:** Before any work, the script validates OWUI and the worker; use `--no-validate` only if you know they are up.
+
+**From the host** (Python 3, no extra deps):
+
+```bash
+# Required env (or set in .env and source / export)
+export OPENWEBUI_BASE_URL=http://localhost:8080
+export OPENWEBUI_API_KEY=your-openwebui-service-token
+export NVIDIA_WORKER_URL=http://localhost:8123
+export VDB_ENDPOINT=http://milvus:19530          # optional
+
+# Dry run (no ingest, no --confirm needed)
+python scripts/backfill_owui_knowledge_to_milvus.py --kb-ids=abc123,def456 --dry-run
+
+# Real run (requires --confirm)
+python scripts/backfill_owui_knowledge_to_milvus.py --kb-ids=abc123,def456 --confirm
+```
+
+If your OWUI version supports listing knowledge bases at `GET /api/v1/knowledge`, you can omit `--kb-ids` and the script will try to backfill all. Otherwise pass `--kb-ids=id1,id2` (IDs from the Knowledge UI or API).
+
+- To re-upload documents that are already in the collection (not recommended): use `--no-skip-existing`.
+- Collection names and Milvus-safe conversion match the pipeline; the script does not create extra or “false” collections—each KB maps to one collection name.
+
 ## Troubleshooting
 - **"coroutine Pipeline.pipe was never awaited"**  
   The pipeline exposes a synchronous `pipe()` so Open WebUI can call it without `await`. If you still see this, ensure you’re on the latest pipeline image and that the Pipelines service has been restarted after an update.
