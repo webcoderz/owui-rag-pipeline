@@ -231,9 +231,10 @@ If your OWUI version supports listing knowledge bases at `GET /api/v1/knowledge`
   The pipeline yields SSE event lines in the format the Open WebUI Pipelines server expects (`data: {...}` per line; the server adds `\n\n`). Chunk payloads include `logprobs` and match the OpenAI-style `chat.completion.chunk` shape. If the UI still doesn't update, check that the OpenAI API URL in Open WebUI points at the Pipelines service and that no proxy is buffering or altering the stream.
 - **Log shows `stream:true:<generator object Pipeline._pipe_async...>`**  
   That log line is from the Pipelines server (it logs the return value of `pipe()`). A **generator** is correct for streaming — it means the pipeline returned a stream. The server then iterates that generator and forwards each chunk to the client. If you previously saw `<coroutine object ...>`, that was the bug (unawaited); seeing `<generator ...>` means the response is set up correctly.
+- **Worker response is HTML / blank UI:** The pipeline’s request to the worker was sent via an HTTP proxy that returned a block page instead of the SSE stream. The pipeline now uses a dedicated HTTP client for worker requests that ignores `HTTP_PROXY` (`trust_env=False`), so worker traffic goes direct. Also set `NO_PROXY` (and `no_proxy`) in the pipelines service so internal hostnames bypass the proxy (see `docker-compose.yaml` default).
 - Proxies:
   - Set `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` in `.env`
-  - Ensure `NO_PROXY` includes internal names: `open-webui,pipelines,nvidia-rag-worker,owui-postgres,milvus,localhost,127.0.0.1`
+  - Ensure `NO_PROXY` includes internal names: `open-webui,pipelines,nvidia-rag-worker,owui-postgres,milvus,milvus-standalone,localhost,127.0.0.1`
 - Networking:
   - Ensure Open WebUI, pipelines, and worker share an external network and can resolve each other by the names in `docker-compose.yaml`
 - Postgres:

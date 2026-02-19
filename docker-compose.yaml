@@ -50,6 +50,9 @@ services:
       HTTP_PROXY: ${HTTP_PROXY}
       HTTPS_PROXY: ${HTTPS_PROXY}
       https_proxy: ${HTTPS_PROXY}
+      # Internal traffic must bypass proxy (otherwise worker/OWUI requests can get HTML block pages)
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,nvidia-rag-worker,milvus,milvus-standalone,open-webui,owui-postgres,pipelines}
+      no_proxy: ${NO_PROXY:-localhost,127.0.0.1,nvidia-rag-worker,milvus,milvus-standalone,open-webui,owui-postgres,pipelines}
       OPENWEBUI_BASE_URL: http://open-webui:8080
       OPENWEBUI_API_KEY: ${OPENWEBUI_API_KEY}
       NVIDIA_WORKER_URL: http://nvidia-rag-worker:8123

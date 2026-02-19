@@ -26,6 +26,12 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+
+def _worker_http_client() -> httpx.AsyncClient:
+    """Use a client that does not use HTTP_PROXY so requests to the worker are not sent via proxy (avoids proxy returning HTML block pages)."""
+    return httpx.AsyncClient(trust_env=False)
+
+
 # #region agent log
 def _debug_log(message: str, data: Optional[dict] = None, hypothesis_id: Optional[str] = None, run_id: Optional[str] = None):
     """Append one NDJSON line to a local file only (no network). Airgapped-safe; copy pipeline_debug/debug.log to share."""
@@ -1166,7 +1172,7 @@ class Pipeline:
                     await status_q.put(_sse_chunk(model_id, msg))
 
                 async def do_ingest():
-                    async with httpx.AsyncClient() as ow_client, httpx.AsyncClient() as worker_client:
+                    async with httpx.AsyncClient() as ow_client, _worker_http_client() as worker_client:
                         adhoc_file_ids, kb_ids = self._split_refs(files)
                         newly_used: List[str] = []
 
@@ -1307,7 +1313,7 @@ class Pipeline:
                     collection_names = await self._filter_collections_by_owui_access(
                         ow_client, collection_names, user_key, user_token
                     )
-                async with httpx.AsyncClient() as worker_client:
+                async with _worker_http_client() as worker_client:
                     collection_names = await self._filter_to_existing_collections(worker_client, collection_names)
                     async for line in self._stream_worker_generate(worker_client, q_messages, collection_names):
                         parsed = _parse_worker_sse_line(model_id, line)
@@ -1369,7 +1375,7 @@ class Pipeline:
             async def delete_stream():
                 yield _sse_chunk(model_id, role="assistant")
                 try:
-                    async with httpx.AsyncClient() as worker_client:
+                    async with _worker_http_client() as worker_client:
                         resp = await self._call_worker_delete_documents(worker_client, collection_name, [filename])
                     yield _sse_chunk(model_id, f"🗑️ Delete request: `{filename}` from `{collection_name}`\n")
                     # Print a compact success message if available
@@ -1417,7 +1423,7 @@ class Pipeline:
             async def emit(msg: str):
                 await status_q.put(_sse_chunk(model_id, msg))
 
-            async with httpx.AsyncClient() as ow_client, httpx.AsyncClient() as worker_client:
+            async with httpx.AsyncClient() as ow_client, _worker_http_client() as worker_client:
                 # Save-to-library decision:
                 # - explicit request field wins
                 # - else use per-chat setting
