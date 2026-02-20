@@ -215,3 +215,4 @@ nv-rag.py
 __pycache__/
 .tmp/
 rag
+.cursor/

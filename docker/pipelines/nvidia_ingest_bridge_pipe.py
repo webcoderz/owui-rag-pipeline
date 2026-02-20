@@ -967,6 +967,11 @@ class Pipeline:
         user_message: Optional[str] = None,
         **kwargs,
     ):
+        # Unconditional: confirm this pipeline is hit and show PIPE_DEBUG env (pipelines container logs).
+        logger.warning(
+            "nvidia_ingest_bridge pipe invoked PIPE_DEBUG=%r",
+            os.getenv("PIPE_DEBUG", ""),
+        )
         user = __user__ or {}
         if not (user.get("id") or user.get("email")):
             # When ENABLE_FORWARD_USER_INFO_HEADERS=True, Open WebUI may send user only in headers
