@@ -125,6 +125,24 @@ def _json_completion(model: str, content: str) -> dict:
     }
 
 
+def _owui_internal_task_minimal_response(text: str) -> Optional[str]:
+    """
+    Open WebUI sends internal requests (follow-up questions, title, tags) to the pipeline model.
+    When OPENWEBUI_API_KEY is not set we must not return an error for these or the UI breaks.
+    Return a minimal valid JSON response for the expected format, or None if this is not an internal task.
+    """
+    if not text or "### task:" not in text:
+        return None
+    t = text.lower()
+    if "follow-up" in t or "follow_ups" in t:
+        return '{"follow_ups": []}'
+    if "title" in t and "subtopic" not in t:
+        return '{"title": "💬 Chat"}'
+    if "tags" in t:
+        return '{"tags": ["general"]}'
+    return None
+
+
 def _extract_content_from_sse_chunk(line: str) -> Optional[str]:
     """Parse a 'data: {...}' SSE line; return choices[0].delta.content or choices[0].message.content."""
     if not line or not line.startswith("data:"):
@@ -626,6 +644,12 @@ class Pipeline:
     # -----------------------
     # OWUI API helpers
     # -----------------------
+
+    def _has_owui_auth(self, user_token: Optional[str] = None) -> bool:
+        """True if we can call Open WebUI (request Bearer token or OPENWEBUI_API_KEY)."""
+        if user_token and str(user_token).strip():
+            return True
+        return bool(self.valves.OPENWEBUI_API_KEY and self.valves.OPENWEBUI_API_KEY.strip())
 
     def _ow_headers(self, user_token: Optional[str] = None) -> Dict[str, str]:
         """Use user's Bearer token when provided (for OWUI access control); else service key."""
@@ -1310,8 +1334,8 @@ class Pipeline:
             async def ingest_only_stream():
                 yield _sse_chunk(model_id, role="assistant")
 
-                if not self.valves.OPENWEBUI_API_KEY:
-                    yield _sse_chunk(model_id, "❌ OPENWEBUI_API_KEY is not set. Cannot access OWUI files/knowledge.\n")
+                if not self._has_owui_auth(user_token):
+                    yield _sse_chunk(model_id, "❌ Open WebUI auth required to access files/knowledge. Use request Bearer token or set OPENWEBUI_API_KEY.\n")
                     yield _sse_done(model_id)
                     return
 
@@ -1443,9 +1467,8 @@ class Pipeline:
 
             async def query_stream():
                 yield _sse_chunk(model_id, role="assistant")
-                if not self.valves.OPENWEBUI_API_KEY:
-                    # Not strictly needed for querying, but keep consistent error surface
-                    yield _sse_chunk(model_id, "❌ OPENWEBUI_API_KEY is not set.\n")
+                if not self._has_owui_auth(user_token):
+                    yield _sse_chunk(model_id, "❌ Open WebUI auth required for RAG. Use request Bearer token or set OPENWEBUI_API_KEY.\n")
                     yield _sse_done(model_id)
                     return
 
@@ -1573,8 +1596,13 @@ class Pipeline:
             # Command handling (these won't show as UI autocomplete; we respond explicitly)
             # (slash commands handled above via non-stream JSON return)
 
-            if not self.valves.OPENWEBUI_API_KEY:
-                yield _sse_chunk(model_id, "❌ OPENWEBUI_API_KEY is not set. Cannot access OWUI files/knowledge.\n")
+            if not self._has_owui_auth(user_token):
+                minimal = _owui_internal_task_minimal_response(text)
+                if minimal is not None:
+                    # Internal OWUI requests (follow-ups, title, tags): return valid JSON so UI doesn't break.
+                    yield _sse_chunk(model_id, minimal + "\n")
+                else:
+                    yield _sse_chunk(model_id, "❌ Open WebUI auth required to access files/knowledge. Use request Bearer token or set OPENWEBUI_API_KEY.\n")
                 yield _sse_done(model_id)
                 return
 
