@@ -84,6 +84,23 @@ async def _maybe_await(value):
     return value
 
 
+def _safe_repr(obj: Any, max_len: int = 500) -> str:
+    """Safe repr for logging SDK responses (avoid huge or non-JSON-serializable output)."""
+    if obj is None:
+        return "None"
+    try:
+        if isinstance(obj, dict):
+            s = json.dumps(obj, default=str)[:max_len]
+            return s + ("..." if len(str(obj)) > max_len else "")
+        if isinstance(obj, (list, tuple)):
+            s = json.dumps(list(obj), default=str)[:max_len]
+            return s + ("..." if len(str(obj)) > max_len else "")
+    except Exception:
+        pass
+    r = repr(obj)
+    return r[:max_len] + ("..." if len(r) > max_len else "")
+
+
 def _benign_milvus_filter(record: logging.LogRecord) -> bool:
     """Return False to suppress known-benign Milvus/SDK warnings (empty metadata_schema/document_info)."""
     msg = (record.getMessage() or "")
@@ -341,12 +358,14 @@ async def ingest(
             "metadata_schema": DEFAULT_METADATA_SCHEMA,
         }
         create_kw = _filter_kwargs_for_callable(ingestor.create_collection, create_kw)
-        await _maybe_await(ingestor.create_collection(**create_kw))
+        create_res = await _maybe_await(ingestor.create_collection(**create_kw))
+        logger.info("Ingest create_collection ok: collection=%s response=%s", collection_name, _safe_repr(create_res))
     except Exception as e:
         err_msg = (getattr(e, "message", None) or str(e)).lower()
         if "already exists" in err_msg or "duplicate" in err_msg:
-            pass  # proceed to upload_documents into the existing collection
+            logger.info("Ingest create_collection skipped (already exists): collection=%s", collection_name)
         else:
+            logger.exception("Ingest create_collection failed: collection=%s vdb=%s error=%s", collection_name, vdb_endpoint, e)
             raise  # don't hide real errors (e.g. invalid name); otherwise upload_documents would fail with "collection does not exist"
 
     # write to temp file because upload_documents expects filepaths
@@ -384,11 +403,13 @@ async def ingest(
             # Collection may have been created earlier without metadata_schema; retry without custom_metadata.
             err_str = (getattr(meta_err, "message", None) or str(meta_err)).lower()
             if "metadata" in err_str or "schema" in err_str:
+                logger.info("Ingest upload_documents retry without custom_metadata: collection=%s", collection_name)
                 upload_kw.pop("custom_metadata", None)
                 resp = await _maybe_await(ingestor.upload_documents(**upload_kw))
             else:
+                logger.exception("Ingest upload_documents failed: collection=%s vdb=%s file=%s error=%s", collection_name, vdb_endpoint, original_filename, meta_err)
                 raise
-        logger.info("Ingest complete (Milvus): collection=%s file=%s", collection_name, original_filename)
+        logger.info("Ingest complete (Milvus): collection=%s file=%s response=%s", collection_name, original_filename, _safe_repr(resp))
         return JSONResponse(resp)
 
     finally:
