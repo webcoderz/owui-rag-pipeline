@@ -397,19 +397,28 @@ class Pipeline:
             )
 
     def _user_from_request_headers(self, __request__: Optional[Any]) -> dict:
-        """When ENABLE_FORWARD_USER_INFO_HEADERS is True, Open WebUI may send user info in request headers. Build a minimal user dict from them."""
+        """When ENABLE_FORWARD_USER_INFO_HEADERS is True, Open WebUI may send user info in request headers. Build a minimal user dict from them. Open WebUI may send header names in lowercase (e.g. x-openwebui-user-id)."""
         if __request__ is None or not getattr(__request__, "headers", None):
             return {}
         h = __request__.headers
-        # Headers may be case-normalized; try common variants (Open WebUI / custom backends)
+        # Open WebUI sends headers in lowercase; try lowercase first, then other variants.
         def _get(*keys: str) -> str:
             for k in keys:
-                v = h.get(k) or h.get(k.lower()) or h.get(k.upper())
-                if v and str(v).strip():
-                    return str(v).strip()
+                for candidate in (k.lower(), k, k.upper()):
+                    v = h.get(candidate) if getattr(h, "get", None) else None
+                    if v and str(v).strip():
+                        return str(v).strip()
+                # Fallback: iterate if headers are list-like (e.g. (name, value) pairs)
+                target = k.lower()
+                try:
+                    for name, val in (h.items() if hasattr(h, "items") else (h if isinstance(h, (list, tuple)) else [])):
+                        if (name or "").lower() == target and val and str(val).strip():
+                            return str(val).strip()
+                except Exception:
+                    pass
             return ""
-        user_id = _get("X-User-Id", "X-OpenWebUI-User-Id")
-        user_email = _get("X-User-Email", "X-OpenWebUI-User-Email")
+        user_id = _get("X-OpenWebUI-User-Id", "X-User-Id")
+        user_email = _get("X-OpenWebUI-User-Email", "X-User-Email")
         if not user_id and not user_email:
             return {}
         return {"id": user_id or None, "email": user_email or None}
@@ -989,9 +998,17 @@ class Pipeline:
             if h is not None:
                 def _hp(*keys: str) -> str:
                     for k in keys:
-                        v = h.get(k) or h.get(k.lower()) or h.get(k.upper())
-                        if v and str(v).strip():
-                            return "present"
+                        for candidate in (k.lower(), k, k.upper()):
+                            v = h.get(candidate) if getattr(h, "get", None) else None
+                            if v and str(v).strip():
+                                return "present"
+                        target = k.lower()
+                        try:
+                            for name, val in (h.items() if hasattr(h, "items") else (h if isinstance(h, (list, tuple)) else [])):
+                                if (name or "").lower() == target and val and str(val).strip():
+                                    return "present"
+                        except Exception:
+                            pass
                     return "missing"
                 id_status = _hp("X-OpenWebUI-User-Id")
                 email_status = _hp("X-OpenWebUI-User-Email")
