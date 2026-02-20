@@ -216,3 +216,4 @@ __pycache__/
 .tmp/
 rag
 .cursor/
+docs/RESEARCH_OWUI_USER_HEADERS.md

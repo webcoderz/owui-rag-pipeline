@@ -644,6 +644,33 @@ class Pipeline:
         r.raise_for_status()
         return r.json()
 
+    async def _user_from_owui_me(self, request_token: Optional[str]) -> dict:
+        """When body/headers have no user, try Open WebUI GET /api/v1/users/me with the request's Bearer token. Returns {} on failure or if no token. With a service API key, this returns the key owner (one identity)."""
+        if not (request_token and str(request_token).strip()):
+            return {}
+        token = (request_token.strip() if request_token else "") or ""
+        if not token.lower().startswith("bearer "):
+            token = f"Bearer {token}"
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    f"{self.valves.OPENWEBUI_BASE_URL}/api/v1/users/me",
+                    headers={"Authorization": token},
+                    timeout=self.valves.OWUI_JSON_TIMEOUT_S,
+                )
+                if r.status_code != 200:
+                    return {}
+                data = r.json()
+                if not isinstance(data, dict):
+                    return {}
+                uid = data.get("id")
+                email = data.get("email")
+                if uid or email:
+                    return {"id": (str(uid).strip() if uid else None), "email": (str(email).strip() if email else None)}
+        except Exception:
+            pass
+        return {}
+
     async def _download_to_tempfile_and_hash(
         self,
         client: httpx.AsyncClient,
@@ -985,11 +1012,28 @@ class Pipeline:
             os.getenv("PIPE_DEBUG", ""),
         )
         user = __user__ or {}
+        # OWUI sends payload["user"] in the body for pipeline models; Pipelines may pass it as __user__ or leave it in body.
+        user_from_body_key = False
+        if not (user.get("id") or user.get("email")) and isinstance(body.get("user"), dict):
+            user = {**user, **body["user"]}
+            user_from_body_key = bool(user.get("id") or user.get("email"))
         if not (user.get("id") or user.get("email")):
             # When ENABLE_FORWARD_USER_INFO_HEADERS=True, Open WebUI may send user only in headers
             header_user = self._user_from_request_headers(__request__)
             if header_user:
                 user = {**user, **header_user}
+        user_from_owui_me = False
+        if not (user.get("id") or user.get("email")):
+            # Fallback: call Open WebUI GET /api/v1/users/me with the request's Bearer token (see README).
+            request_token = None
+            if __request__ is not None and getattr(__request__, "headers", None):
+                h = __request__.headers
+                request_token = (h.get("Authorization") or h.get("authorization") or "").strip() or None
+            if request_token:
+                api_user = await self._user_from_owui_me(request_token)
+                if api_user:
+                    user = {**user, **api_user}
+                    user_from_owui_me = True
         user_key = self._user_key(user)
         # PIPE_DEBUG: log whether user came from body/headers and if user-info headers are present (no values).
         if os.getenv("PIPE_DEBUG", "").lower() in ("1", "true", "yes"):
@@ -1015,11 +1059,18 @@ class Pipeline:
             else:
                 id_status = "no_headers"
                 email_status = "no_headers"
-            user_src = "body" if ((__user__ or {}).get("id") or (__user__ or {}).get("email")) else ("headers" if (user.get("id") or user.get("email")) else ("COLLECTION_USER_KEY" if (self.valves.COLLECTION_USER_KEY or "").strip() and user_key == self._safe_user_key((self.valves.COLLECTION_USER_KEY or "").strip()) else "anon"))
+            user_src = (
+                "body" if ((__user__ or {}).get("id") or (__user__ or {}).get("email")) else
+                ("body_user_key" if user_from_body_key else
+                 ("owui_me" if user_from_owui_me else
+                  ("headers" if (user.get("id") or user.get("email")) else
+                   ("COLLECTION_USER_KEY" if (self.valves.COLLECTION_USER_KEY or "").strip() and user_key == self._safe_user_key((self.valves.COLLECTION_USER_KEY or "").strip()) else "anon"))))
+            )
             logger.warning(
-                "PIPE_DEBUG user: request=%s body_has_id_or_email=%s header_X-OpenWebUI-User-Id=%s header_X-OpenWebUI-User-Email=%s user_key_source=%s",
+                "PIPE_DEBUG user: request=%s __user___has_id_or_email=%s body_has_user_key=%s header_X-OpenWebUI-User-Id=%s header_X-OpenWebUI-User-Email=%s user_key_source=%s",
                 has_request,
                 bool((__user__ or {}).get("id") or (__user__ or {}).get("email")),
+                "user" in body and isinstance(body.get("user"), dict),
                 id_status,
                 email_status,
                 user_src,

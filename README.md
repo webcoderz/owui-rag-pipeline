@@ -195,6 +195,8 @@ For **per-user** library and chat collections (e.g. `owui-u-<user>-library` inst
 
 **Official Open WebUI docs:** [Environment Variable Configuration](https://docs.openwebui.com/getting-started/env-configuration/) → **Security Variables** → **ENABLE_FORWARD_USER_INFO_HEADERS**. The docs state that no other step is required: set the env var to `True` in the Open WebUI deployment. There is no admin UI toggle for this; it is environment-only. When enabled, Open WebUI forwards these headers to downstream APIs: **`X-OpenWebUI-User-Name`**, **`X-OpenWebUI-User-Id`**, **`X-OpenWebUI-User-Email`**, **`X-OpenWebUI-User-Role`**, **`X-OpenWebUI-Chat-Id`** (Open WebUI may send header names in **lowercase**, e.g. `x-openwebui-user-id`; the pipeline checks lowercase first). The pipeline uses Id and Email for collection naming. The docs describe forwarding to "OpenAI API and Ollama API"; Pipelines are connected as an **OpenAI connection** in Admin → Settings → Connections, so the same setting applies to requests from Open WebUI to the Pipelines server.
 
+**User from body:** For **pipeline models**, Open WebUI also sends user in the **request body** (`payload["user"]` with id, email, name, role). The pipeline reads user from: (1) the Pipelines `__user__` argument, (2) **`body["user"]`** if present (in case the Pipelines server leaves it in the body), (3) the headers above, (4) **GET /api/v1/users/me** when the request has a Bearer token, (5) **COLLECTION_USER_KEY** or `anon`. With **PIPE_DEBUG=true**, logs show **`body_has_user_key`** (whether OWUI sent `body["user"]`) and **`user_key_source`** (`body`, `body_user_key`, `headers`, `owui_me`, `COLLECTION_USER_KEY`, or `anon`) so you can see which source was used.
+
 1. **Enable in Open WebUI** (required for header-based user):
    - In your **Open WebUI** deployment (not this repo), set:
      - **`ENABLE_FORWARD_USER_INFO_HEADERS=True`**
@@ -204,9 +206,11 @@ For **per-user** library and chat collections (e.g. `owui-u-<user>-library` inst
    - Restart pipelines: `docker compose restart pipelines`.
    - Trigger a request (e.g. send a message in a chat using the pipeline).
    - In **pipelines** logs (`docker compose logs pipelines`) look for:
-     - `PIPE_DEBUG user: ... header_X-OpenWebUI-User-Id=present header_X-OpenWebUI-User-Email=present ... user_key_source=headers`
+     - `PIPE_DEBUG user: ... __user___has_id_or_email=... body_has_user_key=... header_X-OpenWebUI-User-Id=... user_key_source=...`
+     - Success: `user_key_source=body` or `body_user_key` or `headers` or `owui_me`; or `header_X-OpenWebUI-User-Id=present` when using headers.
    - If you see `header_X-OpenWebUI-User-Id=missing` or `no_headers`, then: (a) confirm **`ENABLE_FORWARD_USER_INFO_HEADERS=True`** is set in the **Open WebUI** container/env and that you **restarted Open WebUI** after setting it; (b) ensure the request goes **through Open WebUI** to the pipeline (e.g. you select the pipeline as the model in the chat UI, or your app calls Open WebUI’s API and the pipeline is the target model)—calling the Pipelines server URL directly from outside Open WebUI will not include these headers; (c) ensure no proxy between Open WebUI and the Pipelines service strips or overwrites the `X-OpenWebUI-*` headers.
-3. **Fallback if you cannot enable headers:** Set **`COLLECTION_USER_KEY`** in the pipelines env (e.g. `COLLECTION_USER_KEY=service-acct`) so all API-key requests use that label instead of `anon` (single shared identity).
+3. **Fallback: Open WebUI “me” API:** If the request has a Bearer token (e.g. the connection’s API key or the user’s JWT) but no user in body or headers, the pipeline calls **`GET {OPENWEBUI_BASE_URL}/api/v1/users/me`** with that token. Open WebUI returns the authenticated user (id, email). When the token is a **service API key**, this returns the key owner (one identity for all requests, similar to `COLLECTION_USER_KEY`). When the token is the **end-user’s JWT** (if Open WebUI forwards it to the pipeline), you get per-user identity. No extra env var is required; the pipeline uses the request’s `Authorization` header. If the endpoint path or response shape differs in your OWUI version, check Swagger at `/api/v1/docs` (with `ENV=dev`).
+4. **Last resort:** Set **`COLLECTION_USER_KEY`** in the pipelines env (e.g. `COLLECTION_USER_KEY=service-acct`) so all API-key requests use that label instead of `anon` (single shared identity).
 
 ## Backfilling existing OWUI knowledge into Milvus
 
