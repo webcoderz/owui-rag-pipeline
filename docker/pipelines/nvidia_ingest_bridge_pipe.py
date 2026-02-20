@@ -26,6 +26,9 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+# One-time warning when pipeline uses "anon" but could have received user from headers (so operator can enable ENABLE_FORWARD_USER_INFO_HEADERS in OWUI).
+_user_headers_warned: bool = False
+
 
 def _worker_http_client() -> httpx.AsyncClient:
     """Use a client that does not use HTTP_PROXY so requests to the worker are not sent via proxy (avoids proxy returning HTML block pages)."""
@@ -980,20 +983,39 @@ class Pipeline:
                 user = {**user, **header_user}
         user_key = self._user_key(user)
         # PIPE_DEBUG: log whether user came from body/headers and if user-info headers are present (no values).
-        if (os.getenv("PIPE_DEBUG", "").lower() in ("1", "true", "yes")) and __request__ is not None and getattr(__request__, "headers", None):
-            h = __request__.headers
-            def _hp(*keys: str) -> str:
-                for k in keys:
-                    v = h.get(k) or h.get(k.lower()) or h.get(k.upper())
-                    if v and str(v).strip():
-                        return "present"
-                return "missing"
+        if os.getenv("PIPE_DEBUG", "").lower() in ("1", "true", "yes"):
+            has_request = __request__ is not None
+            h = getattr(__request__, "headers", None) if has_request else None
+            if h is not None:
+                def _hp(*keys: str) -> str:
+                    for k in keys:
+                        v = h.get(k) or h.get(k.lower()) or h.get(k.upper())
+                        if v and str(v).strip():
+                            return "present"
+                    return "missing"
+                id_status = _hp("X-OpenWebUI-User-Id")
+                email_status = _hp("X-OpenWebUI-User-Email")
+            else:
+                id_status = "no_headers"
+                email_status = "no_headers"
+            user_src = "body" if ((__user__ or {}).get("id") or (__user__ or {}).get("email")) else ("headers" if (user.get("id") or user.get("email")) else ("COLLECTION_USER_KEY" if (self.valves.COLLECTION_USER_KEY or "").strip() and user_key == self._safe_user_key((self.valves.COLLECTION_USER_KEY or "").strip()) else "anon"))
             logger.warning(
-                "PIPE_DEBUG user: body_has_id_or_email=%s header_X-OpenWebUI-User-Id=%s header_X-OpenWebUI-User-Email=%s user_key_source=%s",
+                "PIPE_DEBUG user: request=%s body_has_id_or_email=%s header_X-OpenWebUI-User-Id=%s header_X-OpenWebUI-User-Email=%s user_key_source=%s",
+                has_request,
                 bool((__user__ or {}).get("id") or (__user__ or {}).get("email")),
-                _hp("X-OpenWebUI-User-Id"),
-                _hp("X-OpenWebUI-User-Email"),
-                "body" if ((__user__ or {}).get("id") or (__user__ or {}).get("email")) else ("headers" if (user.get("id") or user.get("email")) else ("COLLECTION_USER_KEY" if (self.valves.COLLECTION_USER_KEY or "").strip() and user_key == self._safe_user_key((self.valves.COLLECTION_USER_KEY or "").strip()) else "anon")),
+                id_status,
+                email_status,
+                user_src,
+            )
+        # One-time warning: using anon with no user in body or headers → suggest enabling ENABLE_FORWARD_USER_INFO_HEADERS in Open WebUI.
+        global _user_headers_warned
+        body_has_user = bool((__user__ or {}).get("id") or (__user__ or {}).get("email"))
+        if not _user_headers_warned and user_key == self._safe_user_key("anon") and not body_has_user and __request__ is not None and getattr(__request__, "headers", None):
+            _user_headers_warned = True
+            logger.warning(
+                "Pipeline using 'anon' for collections; request had no user in body or headers. "
+                "For per-user collections when using API key, set ENABLE_FORWARD_USER_INFO_HEADERS=True in Open WebUI. "
+                "See README: Ensuring user info is forwarded.",
             )
         # Use requesting user's Bearer token for OWUI API when present (enforces KB/user access).
         user_token: Optional[str] = None

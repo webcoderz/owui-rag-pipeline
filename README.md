@@ -189,6 +189,25 @@ Collection naming conventions (prefix defaults to `owui`):
 - Names are **unique per user/chat/kb**, not per ingest: e.g. every `/ingest library` (same user) uses the same collection so documents accumulate. To get a **unique collection per ingest**, set `UNIQUE_LIBRARY_COLLECTION_PER_INGEST=true` (then each `/ingest library` creates e.g. `owui-u-<user>-library-<8-char-id>`), or use an explicit name: `/ingest my-batch-20260220`.
 - **Service account / API key:** When you call the pipeline with a **service account or API key** (no logged-in user), Open WebUI often does not pass a user id/email in the body, so the pipeline would use **`anon`**. You can (1) set **`ENABLE_FORWARD_USER_INFO_HEADERS=True`** in Open WebUI so it sends user info in request headers; the pipeline then reads **`X-User-Id`** / **`X-User-Email`** (or **`X-OpenWebUI-User-Id`** / **`X-OpenWebUI-User-Email`**) and uses them for collection naming when the body has no user. (2) Or set **`COLLECTION_USER_KEY`** in the pipelines environment (e.g. `COLLECTION_USER_KEY=service-acct`) so API-key requests use that label instead of `anon`.
 
+### Ensuring user info is forwarded (critical when using API key)
+
+For **per-user** library and chat collections (e.g. `owui-u-<user>-library` instead of `owui-u-anon-library`), the pipeline must receive the requesting user. When using a **service account or API key**, the request body often has no user, so the pipeline relies on **headers** from Open WebUI.
+
+**Official Open WebUI docs:** [Environment Variable Configuration](https://docs.openwebui.com/getting-started/env-configuration/) → **Security Variables** → **ENABLE_FORWARD_USER_INFO_HEADERS**. The docs state that no other step is required: set the env var to `True` in the Open WebUI deployment. There is no admin UI toggle for this; it is environment-only. When enabled, Open WebUI forwards these headers to downstream APIs: **`X-OpenWebUI-User-Name`**, **`X-OpenWebUI-User-Id`**, **`X-OpenWebUI-User-Email`**, **`X-OpenWebUI-User-Role`**, **`X-OpenWebUI-Chat-Id`**. The pipeline uses Id and Email for collection naming. The docs describe forwarding to "OpenAI API and Ollama API"; Pipelines are connected as an **OpenAI connection** in Admin → Settings → Connections, so the same setting applies to requests from Open WebUI to the Pipelines server.
+
+1. **Enable in Open WebUI** (required for header-based user):
+   - In your **Open WebUI** deployment (not this repo), set:
+     - **`ENABLE_FORWARD_USER_INFO_HEADERS=True`**
+   - Restart Open WebUI after changing env so the setting takes effect. Open WebUI then adds the headers above to its outbound request when calling the pipeline (and other OpenAI-compatible connections).
+2. **Verify from pipeline logs** (optional):
+   - In this repo’s `.env`, set **`PIPE_DEBUG=true`** and ensure **`PIPE_DEBUG`** is passed to the pipelines service (see `docker-compose.yaml`).
+   - Restart pipelines: `docker compose restart pipelines`.
+   - Trigger a request (e.g. send a message in a chat using the pipeline).
+   - In **pipelines** logs (`docker compose logs pipelines`) look for:
+     - `PIPE_DEBUG user: ... header_X-OpenWebUI-User-Id=present header_X-OpenWebUI-User-Email=present ... user_key_source=headers`
+   - If you see `header_X-OpenWebUI-User-Id=missing` or `no_headers`, then: (a) confirm **`ENABLE_FORWARD_USER_INFO_HEADERS=True`** is set in the **Open WebUI** container/env and that you **restarted Open WebUI** after setting it; (b) ensure the request goes **through Open WebUI** to the pipeline (e.g. you select the pipeline as the model in the chat UI, or your app calls Open WebUI’s API and the pipeline is the target model)—calling the Pipelines server URL directly from outside Open WebUI will not include these headers; (c) ensure no proxy between Open WebUI and the Pipelines service strips or overwrites the `X-OpenWebUI-*` headers.
+3. **Fallback if you cannot enable headers:** Set **`COLLECTION_USER_KEY`** in the pipelines env (e.g. `COLLECTION_USER_KEY=service-acct`) so all API-key requests use that label instead of `anon` (single shared identity).
+
 ## Backfilling existing OWUI knowledge into Milvus
 
 If you had knowledge bases in Open WebUI **before** integrating this pipeline, their documents live in OWUI but not in Milvus. Use the backfill script to ingest those into the same collection names the pipeline uses, so RAG queries can search that content.
@@ -257,6 +276,7 @@ If your OWUI version supports listing knowledge bases at `GET /api/v1/knowledge`
 - **Ingest → query flow and the 200 on POST /generate**: When you attach files and send a message, the pipeline (1) ingests into collections and streams status ("✅ Ingestion complete.", "📂 Ingested into: `collection-name`"), (2) then runs the RAG query and streams "💬 Querying…" followed by the model reply. The **200** on `POST /generate` is the worker's successful completion of that RAG request. So: ingest messages first, then "Querying…", then the response; the 200 is expected and indicates the answer was generated successfully.
 
 ## Production checklist (high-signal)
+- **User info when using API key:** If the pipeline is called with a service account/API key and you want per-user library/chat collections, set **`ENABLE_FORWARD_USER_INFO_HEADERS=True`** in your **Open WebUI** deployment so OWUI sends user headers to the pipeline. See [Ensuring user info is forwarded](#ensuring-user-info-is-forwarded-critical-when-using-api-key).
 - **MinIO**: `MINIO_ENDPOINT` must be a Docker-reachable hostname (never `localhost` inside containers). The SDK requires **`MINIO_BUCKET`** for “retrieve collections” and ingest; set it to a bucket that exists in MinIO (e.g. `nv-ingest`, or `default-bucket` / `a-bucket` if that’s what you have). Create the bucket in MinIO if needed.
 - **Generation backend**:
   - If using vLLM/OpenAI: set `GENERATION_BACKEND=openai`, plus `OPENAI_BASE_URL` + `OPENAI_MODEL`.
