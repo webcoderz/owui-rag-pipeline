@@ -5,7 +5,6 @@ import asyncio
 import importlib.util
 from pathlib import Path
 
-import anyio
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -198,8 +197,9 @@ def test_pipe_no_api_key(monkeypatch):
     p = module.Pipeline()
     p.valves.OPENWEBUI_API_KEY = ""
 
-    resp = anyio.run(lambda: p.pipe(body={}, __user__={}))
-    text = anyio.run(lambda: _collect_streaming_text(resp))
+    # pipe() is synchronous; when stream=True it returns a sync generator (not awaitable)
+    resp = p.pipe(body={}, __user__={})
+    text = asyncio.run(_collect_streaming_text(resp))
     assert "OPENWEBUI_API_KEY is not set" in text
     assert "data: [DONE]" in text
 
@@ -210,8 +210,8 @@ def test_pipe_commands(monkeypatch):
     p.valves.OPENWEBUI_API_KEY = "token"
 
     body = {"messages": [{"role": "user", "content": "/commands"}], "stream": True}
-    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "u"}))
-    text = anyio.run(lambda: _collect_streaming_text(resp))
+    resp = p.pipe(body=body, __user__={"id": "u"})
+    text = asyncio.run(_collect_streaming_text(resp))
     assert "Commands:" in text
     assert "data: [DONE]" in text
 
@@ -234,13 +234,13 @@ def test_pipe_library_toggle(monkeypatch):
     monkeypatch.setattr(p, "_chat_set_save_to_library", stub_set)
 
     body_on = {"messages": [{"role": "user", "content": "/library on"}], "stream": True, "chat_id": "c1"}
-    resp_on = anyio.run(lambda: p.pipe(body=body_on, __user__={"id": "u"}))
-    text_on = anyio.run(lambda: _collect_streaming_text(resp_on))
+    resp_on = p.pipe(body=body_on, __user__={"id": "u"})
+    text_on = asyncio.run(_collect_streaming_text(resp_on))
     assert "save new ingests" in text_on.lower()
 
     body_status = {"messages": [{"role": "user", "content": "/library"}], "stream": True, "chat_id": "c1"}
-    resp_st = anyio.run(lambda: p.pipe(body=body_status, __user__={"id": "u"}))
-    text_st = anyio.run(lambda: _collect_streaming_text(resp_st))
+    resp_st = p.pipe(body=body_status, __user__={"id": "u"})
+    text_st = asyncio.run(_collect_streaming_text(resp_st))
     assert "library setting" in text_st.lower()
 
 
@@ -263,8 +263,8 @@ def test_pipe_collection_list(monkeypatch):
     monkeypatch.setattr(p, "_chat_get_save_to_library", stub_chat_get_save_to_library)
 
     body = {"messages": [{"role": "user", "content": "/collection list"}], "stream": True, "chat_id": "c1"}
-    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "u"}))
-    text = anyio.run(lambda: _collect_streaming_text(resp))
+    resp = p.pipe(body=body, __user__={"id": "u"})
+    text = asyncio.run(_collect_streaming_text(resp))
     assert "Collections:" in text
     assert "owui-a" in text
     assert "owui-b" in text
@@ -278,14 +278,17 @@ def test_pipe_ingest_target_collection(monkeypatch):
 
     seen = {"collections": [], "allowlist_added": []}
 
-    async def stub_ow_get_json(client, path: str):
+    async def stub_ow_get_json(client, path: str, user_token=None, **kwargs):
         if path.startswith("/api/v1/knowledge/"):
             return {"files": [{"id": "fid1", "filename": "doc.txt"}]}
         if path.startswith("/api/v1/files/"):
             return {"filename": "upload.txt", "size": 10}
         return {}
 
-    async def stub_ingest_entries_into_collection(ow_client, worker_client, entries, collection_name, emit, model_id: str):
+    async def stub_ingest_entries_into_collection(
+        ow_client, worker_client, entries, collection_name, emit, model_id: str,
+        user_token=None, uploaded_by=None, **kwargs
+    ):
         seen["collections"].append(collection_name)
         await emit(f"(stub ingest to {collection_name})\n")
 
@@ -305,8 +308,8 @@ def test_pipe_ingest_target_collection(monkeypatch):
             {"type": "file", "id": "file-123"},
         ],
     }
-    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "u"}))
-    text = anyio.run(lambda: _collect_streaming_text(resp))
+    resp = p.pipe(body=body, __user__={"id": "u"})
+    text = asyncio.run(_collect_streaming_text(resp))
 
     assert "`owui-custom`" in text
     assert set(seen["collections"]) == {"owui-custom"}
@@ -340,8 +343,8 @@ def test_pipe_query_explicit_collection(monkeypatch):
     monkeypatch.setattr(p, "_library_include_by_default", stub_library_include_by_default)
 
     body = {"messages": [{"role": "user", "content": "/query owui-explicit what is up?"}], "stream": True, "chat_id": "c1"}
-    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "u"}))
-    text = anyio.run(lambda: _collect_streaming_text(resp))
+    resp = p.pipe(body=body, __user__={"id": "u"})
+    text = asyncio.run(_collect_streaming_text(resp))
 
     assert captured["collections"] == ["owui-explicit"]
     assert captured["query"] == "what is up?"
@@ -364,8 +367,8 @@ def test_pipe_delete_command(monkeypatch):
     monkeypatch.setattr(p, "_call_worker_delete_documents", stub_call_worker_delete_documents)
 
     body = {"messages": [{"role": "user", "content": "/delete owui-explicit embedded_table.pdf"}], "stream": True, "chat_id": "c1"}
-    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "u"}))
-    text = anyio.run(lambda: _collect_streaming_text(resp))
+    resp = p.pipe(body=body, __user__={"id": "u"})
+    text = asyncio.run(_collect_streaming_text(resp))
 
     assert captured["collection"] == "owui-explicit"
     assert captured["names"] == ["embedded_table.pdf"]
@@ -386,18 +389,28 @@ def test_pipe_ingest_and_generate(monkeypatch, tmp_path):
         return False
     async def stub_chat_get_save_to_library(user_key: str, chat_id: str):
         return False
-    async def stub_ow_get_json(client, path: str):
+
+    async def stub_ow_get_json(client, path: str, user_token=None, **kwargs):
         if path.startswith("/api/v1/knowledge/"):
             return {"files": [{"id": "fid1", "filename": "doc.txt"}]}
         if path.startswith("/api/v1/files/"):
             return {"filename": "upload.txt", "size": 10}
         return {}
-    async def stub_download_to_tempfile_and_hash(client, file_id: str, filename: str, emit, model_id: str):
+
+    async def stub_download_to_tempfile_and_hash(
+        client, file_id: str, filename: str, emit, model_id: str,
+        user_token=None, **kwargs
+    ):
         f = tmp_path / filename
         f.write_text("dummy")
         return str(f), "sha123", 5
-    async def stub_call_worker_ingest_from_path(client, collection_name: str, filename: str, tmp_path_str: str):
+
+    async def stub_call_worker_ingest_from_path(
+        client, collection_name: str, filename: str, tmp_path_str: str,
+        uploaded_by=None, **kwargs
+    ):
         return {"ok": True, "collection_name": collection_name}
+
     async def stub_manifest_get_status(file_id: str, collection: str, sha: str):
         return None
     async def stub_manifest_try_claim(file_id: str, collection: str, sha: str):
@@ -408,6 +421,14 @@ def test_pipe_ingest_and_generate(monkeypatch, tmp_path):
         yield 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
         yield "data: [DONE]\n\n"
 
+    async def stub_filter_to_existing_collections(client, collection_names):
+        return list(collection_names) if collection_names else []
+
+    async def stub_filter_collections_by_owui_access(ow_client, collection_names, user_key, user_token=None):
+        return list(collection_names) if collection_names else []
+
+    monkeypatch.setattr(p, "_filter_to_existing_collections", stub_filter_to_existing_collections)
+    monkeypatch.setattr(p, "_filter_collections_by_owui_access", stub_filter_collections_by_owui_access)
     monkeypatch.setattr(p, "_allowlist_get", stub_allowlist_get)
     monkeypatch.setattr(p, "_allowlist_add", stub_allowlist_add)
     monkeypatch.setattr(p, "_library_include_by_default", stub_library_include_by_default)
@@ -436,8 +457,8 @@ def test_pipe_ingest_and_generate(monkeypatch, tmp_path):
         "chat_id": "chat-1",
     }
 
-    resp = anyio.run(lambda: p.pipe(body=body, __user__={"id": "user@example.com"}))
-    text = anyio.run(lambda: _collect_streaming_text(resp))
+    resp = p.pipe(body=body, __user__={"id": "user@example.com"})
+    text = asyncio.run(_collect_streaming_text(resp))
 
     # status emissions
     assert "Attachments detected" in text
