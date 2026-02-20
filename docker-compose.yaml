@@ -65,6 +65,8 @@ services:
       DATABASE_URL: postgresql://owui:owui@owui-postgres:5432/owui_bridge
       MAX_PARALLEL_FILE_INGEST: "4"
     volumes:
+      # Patched main.py: passes request headers (e.g. Authorization) into pipe() as __request__ so the pipeline can use the user's Bearer token. See pipelines_overlay/README.md.
+      - ./pipelines_overlay/main.py:/app/main.py:ro
       - ./docker/pipelines/nvidia_ingest_bridge_pipe.py:/app/pipelines/nvidia_ingest_bridge_pipe.py:ro
       # Some Pipelines builds copy/import pipelines from a per-pipeline subfolder (created at startup).
       # Mount into both locations so updates always apply.

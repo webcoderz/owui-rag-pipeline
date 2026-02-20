@@ -1110,9 +1110,24 @@ class Pipeline:
                 "See README: Ensuring user info is forwarded.",
             )
         # Use requesting user's Bearer token for OWUI API when present (enforces KB/user access).
+        # Try __request__.headers first. Upstream open-webui/pipelines main.py does NOT pass the request
+        # into pipe() (see docs/RESEARCH_OWUI_USER_HEADERS.md §11 and docs/pipelines_patch_pass_request.md).
+        # Fallback: body (body["Authorization"] etc. if a proxy or patched Pipelines puts the token there).
         user_token: Optional[str] = None
         if __request__ is not None and getattr(__request__, "headers", None):
-            user_token = (__request__.headers.get("Authorization") or "").strip() or None
+            user_token = (__request__.headers.get("Authorization") or __request__.headers.get("authorization") or "").strip() or None
+        token_from_body = False
+        if not user_token and isinstance(body, dict):
+            raw = (body.get("Authorization") or body.get("authorization") or body.get("access_token") or body.get("token") or "")
+            if isinstance(raw, str) and raw.strip():
+                user_token = raw.strip() if raw.strip().lower().startswith("bearer ") else f"Bearer {raw.strip()}"
+                token_from_body = True
+        if (os.getenv("PIPE_DEBUG", "").lower() in ("1", "true", "yes")):
+            logger.warning(
+                "PIPE_DEBUG auth: has_user_token=%s token_source=%s",
+                bool(user_token),
+                "body" if token_from_body else ("request_headers" if user_token and __request__ else "none"),
+            )
         model_id = body.get("model") or "nvidia-rag-auto-ingest"
 
         chat_id = body.get("chat_id") or body.get("conversation_id") or body.get("id") or str(_now())
