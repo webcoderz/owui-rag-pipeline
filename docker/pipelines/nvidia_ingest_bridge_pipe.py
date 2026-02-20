@@ -491,8 +491,14 @@ class Pipeline:
         - library: payload = user_key (safe segment)
         - chat: payload = user_key or None (None if not user-scoped)
         - kb: payload = kb_id
+        Accepts both display form (owui-u-...) and Milvus-safe form (owui_u_...).
         """
-        if not name or not name.startswith(self.valves.COLLECTION_PREFIX):
+        if not name:
+            return ("unknown", None)
+        # Normalize Milvus-safe (underscore) to display (hyphen) so rest of parsing works
+        if name.startswith(self.valves.COLLECTION_PREFIX + "_"):
+            name = name.replace("_", "-")
+        if not name.startswith(self.valves.COLLECTION_PREFIX):
             return ("unknown", None)
         rest = name[len(self.valves.COLLECTION_PREFIX) :].lstrip("-")
         if rest.startswith("u-") and "-library" in rest:
@@ -1193,6 +1199,7 @@ class Pipeline:
             "Commands:\n"
             "- /collection list — show this chat’s known/remembered collections\n"
             "- /forget — clear this chat's remembered collections (next message won't use RAG until you attach again)\n"
+            "- /collections all — list all your collections in Milvus (library, chat, KBs)\n"
                     "- /library on — save future ingests to your library\n"
             "- /library off — do not save future ingests to your library\n"
             "- /library — show this chat's current save-to-library setting\n"
@@ -1207,6 +1214,7 @@ class Pipeline:
             "Commands:\n"
             "- /commands or /help — show this help\n"
             "- /collection list — show this chat's known/remembered collections + derived chat/library names\n"
+            "- /collections all — list all collections in Milvus you have access to (library, chat, KBs)\n"
             "- /forget — clear this chat's remembered collections; next message won't use RAG until you attach again or use /query <collection>\n"
             "- /library — show this chat's current save-to-library setting\n"
             "- /library on — future ingests in this chat also save to your per-user library\n"
@@ -1273,6 +1281,41 @@ class Pipeline:
             if stream:
                 return _sync_stream_from_async(collections_stream())
             return _json_completion(model_id, "Use stream=true for /collection list.")
+
+        # /collections all or /my collections: fetch all Milvus collections this user can access
+        if text.strip().lower() in ("/collections all", "/my collections"):
+            async def collections_all_stream():
+                yield _sse_chunk(model_id, role="assistant")
+                try:
+                    async with httpx.AsyncClient() as ow_client, _worker_http_client() as worker_client:
+                        all_names = list(await self._worker_get_existing_collections(worker_client))
+                        filtered = await self._filter_collections_by_owui_access(
+                            ow_client, all_names, user_key, user_token
+                        )
+                    filtered = sorted(set(filtered))
+                    # Display names in user-friendly form (hyphens) when they're Milvus-safe (underscores)
+                    def display_name(n: str) -> str:
+                        if n and n.startswith(self.valves.COLLECTION_PREFIX + "_"):
+                            return n.replace("_", "-")
+                        return n
+                    lines: List[str] = []
+                    lines.append("Your collections (all you have access to in Milvus):\n\n")
+                    if filtered:
+                        for c in filtered:
+                            lines.append(f"- `{display_name(c)}`\n")
+                        lines.append(f"\nTotal: {len(filtered)} collection(s).\n")
+                    else:
+                        lines.append("(none)\n")
+                    lines.append("\nUse `/query <collection> <question>` to query a specific collection.\n")
+                    yield _sse_chunk(model_id, "".join(lines))
+                except Exception as e:
+                    logger.exception("collections all failed")
+                    yield _sse_chunk(model_id, f"❌ Failed to list your collections: {e}\n")
+                yield _sse_done(model_id)
+
+            if stream:
+                return _sync_stream_from_async(collections_all_stream())
+            return _json_completion(model_id, "Use stream=true for /collections all.")
 
         # /forget: clear this chat's remembered collections so next message won't use RAG unless user attaches again
         if text == "/forget":
