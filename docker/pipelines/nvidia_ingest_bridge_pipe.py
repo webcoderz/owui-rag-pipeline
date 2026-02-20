@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 # One-time warning when pipeline uses "anon" but could have received user from headers (so operator can enable ENABLE_FORWARD_USER_INFO_HEADERS in OWUI).
 _user_headers_warned: bool = False
+_anon_library_rag_warned: bool = False
 
 
 def _worker_http_client() -> httpx.AsyncClient:
@@ -796,6 +797,12 @@ class Pipeline:
         }
         if (uploaded_by or "").strip():
             form["uploaded_by"] = (uploaded_by or "").strip()
+        logger.info(
+            "Pipeline → worker POST /ingest: collection=%s file=%s url=%s",
+            milvus_name,
+            filename,
+            f"{self.valves.NVIDIA_WORKER_URL}/ingest",
+        )
         with open(tmp_path, "rb") as f:
             files = {"file": (filename, f)}
             r = await client.post(
@@ -879,8 +886,49 @@ class Pipeline:
             out.append(name)
         return out
 
-    async def _stream_worker_generate(self, client: httpx.AsyncClient, messages: List[dict], collection_names: List[str]):
+    async def _stream_worker_generate(
+        self,
+        client: httpx.AsyncClient,
+        messages: List[dict],
+        collection_names: List[str],
+        *,
+        user_key: Optional[str] = None,
+    ):
+        # When we have a real user, never send anon library (e.g. allowlist from before Session auth)
+        if user_key and self._safe_user_key(user_key) != self._safe_user_key("anon"):
+            safe_anon = self._safe_user_key("anon")
+
+            def is_anon_library(name: str) -> bool:
+                ctype, payload = self._parse_collection_name(name)
+                return ctype == "library" and payload == safe_anon
+
+            before = len(collection_names)
+            collection_names = [c for c in collection_names if not is_anon_library(c)]
+            if len(collection_names) < before:
+                logger.info(
+                    "Dropped anon library from RAG list (current user_key=%s); %s → %s collections",
+                    self._safe_user_key(user_key),
+                    before,
+                    len(collection_names),
+                )
         milvus_names = [self._to_milvus_safe_collection_name(c) or c for c in collection_names]
+        # Log what we send so worker logs (e.g. owui_u_anon_library) can be traced to pipeline user_key
+        logger.info(
+            "Pipeline → worker RAG: collection_names=%s (milvus_safe=%s)",
+            collection_names,
+            milvus_names,
+        )
+        # One-time hint when anon library is being sent (user_key was anon; often means request/Bearer not passed)
+        global _anon_library_rag_warned
+        if not _anon_library_rag_warned and any(
+            c and "anon" in (c or "") and "library" in (c or "") for c in (milvus_names + collection_names)
+        ):
+            _anon_library_rag_warned = True
+            logger.warning(
+                "RAG is using anon library (owui_u_anon_library). The pipeline resolved user_key=anon. "
+                "For per-user collections: (1) mount pipelines_overlay/main.py so __request__ is passed, "
+                "(2) set Pipelines connection auth to Session in Open WebUI, (3) restart pipelines."
+            )
         payload = {
             "messages": messages,
             "collection_names": milvus_names,
@@ -1556,7 +1604,9 @@ class Pipeline:
                     )
                 async with _worker_http_client() as worker_client:
                     collection_names = await self._filter_to_existing_collections(worker_client, collection_names)
-                    async for line in self._stream_worker_generate(worker_client, q_messages, collection_names):
+                    async for line in self._stream_worker_generate(
+                        worker_client, q_messages, collection_names, user_key=user_key
+                    ):
                         parsed = _parse_worker_sse_line(model_id, line)
                         if parsed is not None:
                             yield parsed
@@ -1689,9 +1739,34 @@ class Pipeline:
                 files = body.get("files") or []
                 newly_used: List[str] = []
 
+                # Log so we can see why ingest might never run (worker never sees "Ingest request")
+                logger.info(
+                    "Pipeline runner: body.files len=%s (sample types=%s); has_owui_auth=%s",
+                    len(files),
+                    [f.get("type") for f in (files or [])[:5]],
+                    self._has_owui_auth(user_token),
+                )
+                if not files:
+                    logger.info(
+                        "Pipeline: no ingest this request (body.files empty). Body keys: %s",
+                        list(body.keys()) if isinstance(body, dict) else "not-dict",
+                    )
+
                 if files:
                     await emit("📎 Attachments detected. Preparing ingestion…\n")
                     adhoc_file_ids, kb_ids = self._split_refs(files)
+                    logger.info(
+                        "Pipeline: ingest path adhoc_file_ids=%s kb_ids=%s → will call worker /ingest",
+                        adhoc_file_ids,
+                        kb_ids,
+                    )
+                    if not adhoc_file_ids and not kb_ids:
+                        logger.warning(
+                            "Pipeline: body.files had %s items but _split_refs found no file/collection ids. "
+                            "Each item needs type in ('file','collection') and id. Sample: %s",
+                            len(files),
+                            [{k: v for k, v in (f or {}).items() if k in ("type", "id", "filename")} for f in files[:3]],
+                        )
 
                     # Knowledge collections
                     for kb_id in kb_ids:
@@ -1779,7 +1854,9 @@ class Pipeline:
                 worker_line_count = 0
                 first_worker_yield_logged = False
                 # #endregion
-                async for line in self._stream_worker_generate(worker_client, messages, final_collections):
+                async for line in self._stream_worker_generate(
+                    worker_client, messages, final_collections, user_key=user_key
+                ):
                     while not status_q.empty():
                         yield await status_q.get()
                     line = line.strip()
