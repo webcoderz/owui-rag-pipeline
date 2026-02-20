@@ -164,6 +164,10 @@ class Pipeline:
         # Naming/policy
         COLLECTION_PREFIX: str = Field(default="owui")
         USER_SCOPED_CHAT_COLLECTIONS: bool = Field(default=True)
+        # If True, /ingest library uses a unique suffix per ingest (e.g. owui-u-anon-library-<id>) so each ingest creates a new collection.
+        UNIQUE_LIBRARY_COLLECTION_PER_INGEST: bool = Field(default=False)
+        # When set, used as the "user" segment for collection names when the request has no user (e.g. service account / API key). Otherwise "anon" is used.
+        COLLECTION_USER_KEY: str = Field(default="")
 
         # Library defaults
         LIBRARY_ENABLED_DEFAULT: bool = Field(default=True)
@@ -216,6 +220,17 @@ class Pipeline:
         set_if_env("NVIDIA_WORKER_URL", str)
         set_if_env("VDB_ENDPOINT", str)
         set_if_env("DATABASE_URL", str)
+        set_if_env("COLLECTION_PREFIX", str)
+        def set_bool(name: str):
+            v = os.getenv(name)
+            if v is None or v == "":
+                return
+            try:
+                setattr(self.valves, name, str(v).lower() in ("true", "1", "yes"))
+            except Exception:
+                return
+        set_bool("UNIQUE_LIBRARY_COLLECTION_PER_INGEST")
+        set_if_env("COLLECTION_USER_KEY", str)
         set_if_env("MAX_PARALLEL_FILE_INGEST", int)
         set_if_env("PENDING_WAIT_SECONDS", int)
         set_if_env("CHUNK_SIZE", int)
@@ -378,8 +393,31 @@ class Pipeline:
                 """
             )
 
+    def _user_from_request_headers(self, __request__: Optional[Any]) -> dict:
+        """When ENABLE_FORWARD_USER_INFO_HEADERS is True, Open WebUI may send user info in request headers. Build a minimal user dict from them."""
+        if __request__ is None or not getattr(__request__, "headers", None):
+            return {}
+        h = __request__.headers
+        # Headers may be case-normalized; try common variants (Open WebUI / custom backends)
+        def _get(*keys: str) -> str:
+            for k in keys:
+                v = h.get(k) or h.get(k.lower()) or h.get(k.upper())
+                if v and str(v).strip():
+                    return str(v).strip()
+            return ""
+        user_id = _get("X-User-Id", "X-OpenWebUI-User-Id")
+        user_email = _get("X-User-Email", "X-OpenWebUI-User-Email")
+        if not user_id and not user_email:
+            return {}
+        return {"id": user_id or None, "email": user_email or None}
+
     def _user_key(self, user: dict) -> str:
-        return str(user.get("id") or user.get("email") or "anon")
+        id_or_email = user.get("id") or user.get("email")
+        if id_or_email:
+            return str(id_or_email)
+        if (self.valves.COLLECTION_USER_KEY or "").strip():
+            return (self.valves.COLLECTION_USER_KEY or "").strip()
+        return "anon"
 
     def _safe_user_key(self, user_key: str) -> str:
         return user_key.replace("@", "_").replace(":", "_").replace("/", "_")
@@ -409,9 +447,12 @@ class Pipeline:
         user_key = self._safe_user_key(self._user_key(user))
         return f"{self.valves.COLLECTION_PREFIX}-u-{user_key}-chat-{chat_id}"
 
-    def _library_collection_name(self, user_key: str) -> str:
+    def _library_collection_name(self, user_key: str, unique_suffix: Optional[str] = None) -> str:
         safe = self._safe_user_key(user_key)
-        return f"{self.valves.COLLECTION_PREFIX}-u-{safe}-library"
+        base = f"{self.valves.COLLECTION_PREFIX}-u-{safe}-library"
+        if unique_suffix:
+            return f"{base}-{unique_suffix}"
+        return base
 
     def _parse_collection_name(self, name: str) -> Tuple[str, Any]:
         """
@@ -424,9 +465,9 @@ class Pipeline:
         if not name or not name.startswith(self.valves.COLLECTION_PREFIX):
             return ("unknown", None)
         rest = name[len(self.valves.COLLECTION_PREFIX) :].lstrip("-")
-        if rest.startswith("u-") and rest.endswith("-library"):
-            # owui-u-{safe}-library
-            segment = rest[2 : -len("-library")].strip()
+        if rest.startswith("u-") and "-library" in rest:
+            # owui-u-{safe}-library or owui-u-{safe}-library-{unique_suffix}
+            segment = rest[2:].split("-library")[0].strip()
             return ("library", segment)
         if rest.startswith("u-") and "-chat-" in rest:
             # owui-u-{safe}-chat-{chat_id}
@@ -720,7 +761,7 @@ class Pipeline:
             return collection_names
         existing = await self._worker_get_existing_collections(client)
         if not existing:
-            return collection_names
+            return []  # none exist yet (e.g. no ingest run); don't pass names through or worker will error
         out = []
         for c in collection_names:
             milvus_name = self._to_milvus_safe_collection_name(c) or c
@@ -927,7 +968,28 @@ class Pipeline:
         **kwargs,
     ):
         user = __user__ or {}
+        if not (user.get("id") or user.get("email")):
+            # When ENABLE_FORWARD_USER_INFO_HEADERS=True, Open WebUI may send user only in headers
+            header_user = self._user_from_request_headers(__request__)
+            if header_user:
+                user = {**user, **header_user}
         user_key = self._user_key(user)
+        # PIPE_DEBUG: log whether user came from body/headers and if user-info headers are present (no values).
+        if (os.getenv("PIPE_DEBUG", "").lower() in ("1", "true", "yes")) and __request__ is not None and getattr(__request__, "headers", None):
+            h = __request__.headers
+            def _hp(*keys: str) -> str:
+                for k in keys:
+                    v = h.get(k) or h.get(k.lower()) or h.get(k.upper())
+                    if v and str(v).strip():
+                        return "present"
+                return "missing"
+            logger.warning(
+                "PIPE_DEBUG user: body_has_id_or_email=%s header_X-OpenWebUI-User-Id=%s header_X-OpenWebUI-User-Email=%s user_key_source=%s",
+                bool((__user__ or {}).get("id") or (__user__ or {}).get("email")),
+                _hp("X-OpenWebUI-User-Id"),
+                _hp("X-OpenWebUI-User-Email"),
+                "body" if ((__user__ or {}).get("id") or (__user__ or {}).get("email")) else ("headers" if (user.get("id") or user.get("email")) else ("COLLECTION_USER_KEY" if (self.valves.COLLECTION_USER_KEY or "").strip() and user_key == self._safe_user_key((self.valves.COLLECTION_USER_KEY or "").strip()) else "anon")),
+            )
         # Use requesting user's Bearer token for OWUI API when present (enforces KB/user access).
         user_token: Optional[str] = None
         if __request__ is not None and getattr(__request__, "headers", None):
@@ -1143,7 +1205,10 @@ class Pipeline:
             if raw_after.lower() == "chat":
                 target_collection = self._chat_collection_name(chat_id, user)
             elif raw_after.lower() == "library":
-                target_collection = self._library_collection_name(user_key)
+                if self.valves.UNIQUE_LIBRARY_COLLECTION_PER_INGEST:
+                    target_collection = self._library_collection_name(user_key, unique_suffix=uuid.uuid4().hex[:8])
+                else:
+                    target_collection = self._library_collection_name(user_key)
             else:
                 target_collection = self._sanitize_collection_name(raw_after) if raw_after else ""
 

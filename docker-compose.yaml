@@ -57,6 +57,9 @@ services:
       OPENWEBUI_API_KEY: ${OPENWEBUI_API_KEY}
       NVIDIA_WORKER_URL: http://nvidia-rag-worker:8123
       VDB_ENDPOINT: ${VDB_ENDPOINT:-http://milvus:19530}
+      COLLECTION_PREFIX: ${COLLECTION_PREFIX:-owui}
+      UNIQUE_LIBRARY_COLLECTION_PER_INGEST: ${UNIQUE_LIBRARY_COLLECTION_PER_INGEST:-false}
+      COLLECTION_USER_KEY: ${COLLECTION_USER_KEY:-}
       PIPELINES_API_KEY: 0p3n-w3bu!
       DATABASE_URL: postgresql://owui:owui@owui-postgres:5432/owui_bridge
       MAX_PARALLEL_FILE_INGEST: "4"
