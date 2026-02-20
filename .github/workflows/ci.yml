@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest fastapi "uvicorn[standard]" httpx starlette anyio python-multipart requests asyncpg
+          pip install pytest fastapi "uvicorn[standard]" httpx starlette anyio python-multipart requests asyncpg hypothesis
 
       - name: Run tests
         run: |
